@@ -1,0 +1,5 @@
+__pycache__/
+train_log/
+.git/
+.ipynb_checkpoints/
+models/
