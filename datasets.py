@@ -8,12 +8,29 @@ import tensorflow as tf
 import time
 
 import utils
+import config as cfg
+
+# For loading emoji, utils should be better here?
+import requests
+import PIL.Image
+import io
+
+# Showing emoji
+import matplotlib.pyplot as plt
 
 # Only for samples_str
 import json 
 # --- MNIST --- (later as Class maybe)
 
-
+def get_data():
+	""" Main Function to cal, will give data dependent on task/configs """
+	if cfg.MODEL_TASK == "classify":
+		# TODO Need to expand for EMNIST
+		return get_MNIST()
+	elif cfg.MODEL_TASK == "growing":
+		return get_emoji_data()
+	else:
+		raise ValueError()
 
 def get_MNIST():
 	print("Loading MNIST ... ", end="")
@@ -95,11 +112,89 @@ class SamplePool:
 
 	def sample(self, n):
 		""" Sample n random elements from pool and return new pool of size n"""
-		idx = np.random.choice(self._size, n, False)
-		batch = {k: getattr(self, k)[idx] for k in self._slot_names}
-		batch = SamplePool(**batch, _parent=self, _parent_idx=idx)
-		return batch
+		# TODO is more tricky for MNIST
+		idx = np.random.choice(self._size, n, replace=False)
+		return self.pool[idx]
+		# batch = {k: getattr(self, k)[idx] for k in self._slot_names}
+		# batch = SamplePool(**batch, _parent=self, _parent_idx=idx)
+		# return batch
 
 	def commit(self):
+		""" I think it updates the parent via the batch or so """
 		for k in self._slot_names:
 			getattr(self._parent, k)[self._parent_idx] = getattr(self, k)
+
+
+# Not sure if it should be a class...
+class Emoji:
+	
+	def __init__(self, emoji_str):
+		self.emoji_img = self.get_emoji_img(emoji_str)
+		self.emoji_rgb = utils.rgba_to_rgb(self.emoji_img)
+
+	def get_emoji_img(self, emoji_str):
+		emoji_char = self.get_emoji_char(emoji_str)
+
+		code = hex(ord(emoji_char))[2:].lower()
+		emoji_url = 'https://github.com/googlefonts/noto-emoji/raw/master/png/128/emoji_u%s.png'%code
+		emoji_img = self.load_image(emoji_url)
+		return emoji_img
+
+	def get_emoji_char(self, emoji_str):
+		# TODO add more emojis, maybe put func in utils?
+		if emoji_str == "lizard":
+			return "🦎"
+		else:
+			raise ValueError(f"string: {emoji_str} not implemented")
+
+	def load_image(self, url, max_size=cfg.TARGET_SIZE):
+		r = requests.get(url)
+		img = PIL.Image.open(io.BytesIO(r.content))
+		img.thumbnail((max_size, max_size), PIL.Image.ANTIALIAS)
+		img = np.float32(img)/255.0
+		return img
+
+	def show_emoji(self):
+		plt.imshow(self.emoji_img)
+		plt.axis("off")
+		plt.show()
+
+def get_emoji_data(random=False):
+	""" Gives data in the style of classificiation, for consistency """
+	# applying alpha channel and removing alpha channel
+	y = Emoji(cfg.TARGET_EMOJI).emoji_img
+	y[..., :3] *= y[..., 3:]
+	y = y[..., :3]
+	
+	if random:
+		x = random_seed()
+	else:
+		x = init_seed()
+
+	# TODO I think somewhere here is the error...
+	x_batch = np.repeat(x, cfg.POOL_SIZE, 0)
+	y_batch = np.repeat(np.expand_dims(y, 0), cfg.POOL_SIZE, 0)
+
+	# Test Data not useful, thus just None for consistency
+	return (x_batch, y_batch), (None, None)
+
+
+# TODO not sure where to fit seeds, but here seems k
+def init_seed():
+	""" Get initial World seed with single alive cell in the middle """
+	assert cfg.CHANNEL_N >= 3, "CHANNEL_N has to be greater 3 to account for rgb"
+	seed = np.zeros([1, cfg.TARGET_SIZE, cfg.TARGET_SIZE, cfg.CHANNEL_N], np.float32)
+
+	# Selecting the middle pixel and setting it to black, no just activating middle cells
+	# TODO (why 3:)
+	seed[:, cfg.TARGET_SIZE//2, cfg.TARGET_SIZE//2, 3:] = 1.0
+
+	return seed
+
+def random_seed():
+	seed = np.random.uniform(0, 1, [1, cfg.TARGET_SIZE, cfg.TARGET_SIZE, cfg.CHANNEL_N])
+
+	# Selecting the middle pixel and setting it to black
+	# seed[:, cfg.TARGET_SIZE//2, cfg.TARGET_SIZE//2, :3] = 1.0
+
+	return seed

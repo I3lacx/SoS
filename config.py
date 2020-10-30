@@ -6,24 +6,41 @@ import tensorflow as tf
 
 
 # ----- Global Variables -------
-CHANNEL_N = 19 # Number of CA state channels
-BATCH_SIZE = 16
+CHANNEL_N = 16 # Number of CA state channels (includes rgb for growing)
+BATCH_SIZE = 8
 POOL_SIZE = BATCH_SIZE * 10
-CELL_FIRE_RATE = 0.5  # Random chance if single cell will update or not, as there is no global clock in a cell system
+CELL_FIRE_RATE = 1  # Random chance if single cell will update or not, as there is no global clock in a cell system
 
-MODEL_TYPE = '3 mutating'  #@param ['1 naive', '2 persistent', '3 mutating']
+HIDDEN_LAYERS = 0 	# Number of hidden layers {0,1,...}
+HIDDEN_FILTER_SIZE = 128 # Number of filters in hidden layer
+
+MODEL_TASK = 'growing' #@param ["growing", "classify"]
+MODEL_TYPE = '3'  #@param ['1 naive', '2 persistent', '3 mutating']
 LOSS_TYPE = "l2"  #@param ['l2', 'ce']
 ADD_NOISE = "True"  #@param ['True', 'False']
+CA_STEP_RANGE = [50, 60]	# RANGE of CA steps until update function is applied
+
+# Only for growing Model, which emoji to grow, idk how to get those Ascis
+TARGET_EMOJI = "lizard" # in string form, defined in datasets.Emoji
+TARGET_SIZE = 40
+
+# ----- Learning ------
+LR = 1e-3
+LAYER_NORM = True
+
+
+USE_TIMER = True		# Prints and (saves) times of methods
 
 # Environment Size is dimensions that are not influenced by updates
-# E.g. 1 for gray_scale, 3 for RGB
-ENV_SIZE = 1 
+# E.g. 1 for gray_scale, 3 for RGB, 0 for growing emojis
+ENV_SIZE = 0
 
+SAVE_MODEL = False
 
 USE_PATTERN_POOL, MUTATE_POOL = {
-		'1 naive': (False, False),
-		'2 persistent': (True, False),
-		'3 mutating': (True, True)
+		'1': (False, False),
+		'2': (True, False),
+		'3': (True, True)
 		}[MODEL_TYPE]
 ADD_NOISE = ADD_NOISE == 'True'
 
