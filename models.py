@@ -25,8 +25,8 @@ from tensorflow.python.framework import convert_to_constants
 class CAModel(tf.keras.Model):
 	""" Two modes, growing and classify, two completely seperate tasks """
 
-	def __init__(self, channel_n=cfg.CHANNEL_N, fire_rate=cfg.CELL_FIRE_RATE,
-							 add_noise=cfg.ADD_NOISE, env_size=cfg.ENV_SIZE):
+	def __init__(self, channel_n=cfg.MODEL.CHANNEL_N, fire_rate=cfg.WORLD.CELL_FIRE_RATE,
+							 add_noise=cfg.TRAIN.ADD_NOISE, env_size=cfg.WORLD.ENV_SIZE):
 		# CHANNEL_N does *not* include the greyscale channel.
 		# but it does include the 10 possible outputs.
 		super().__init__()
@@ -36,44 +36,44 @@ class CAModel(tf.keras.Model):
 		self.env_size = env_size
 
 		self.perceive = tf.keras.Sequential([
-					Conv2D(80, 3, activation=tf.nn.relu, padding="SAME"),
+					tf.keras.Input(shape=(cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)),
+					Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=tf.nn.relu, padding="SAME"),
 			], name="perceive")  # 80 filters, why 80?
 
 		self.dmodel = self.get_dmodel()
-		"""
-		self.dmodel = tf.keras.Sequential([
-					Conv2D(80, 1, activation=tf.nn.relu),
-					Conv2D(self.channel_n, 1, activation=None, kernel_initializer=tf.zeros_initializer)
-					# Init by zeros because it helps learning. As if its random, the optimizer has to fight
-					# to remove badly learned patterns, but starting at 0 is easier to learn
-		])
-		"""
 
-		"""
-		self.test = tf.keras.Sequential([
-			Conv2D(80, 3, activation=tf.nn.relu, padding="SAME"),
-			Conv2D(self.channel_n, 1)])# , kernel_initializer=tf.zeros_initializer)])
-		"""
-
-		# TODO is this needed or just for testing?
-		# self(tf.zeros([1, 3, 3, channel_n + cfg.ENV_SIZE]))  # dummy calls to build the model
-		self(tf.zeros([1, 3, 3, channel_n + cfg.ENV_SIZE]))
+		# Input Layer this works, zeroes would also work
+		self(tf.keras.Input(shape=(cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)))
+		# self(tf.ones([1, 3, 3, channel_n + cfg.WORLD.ENV_SIZE]))
 
 	def get_dmodel(self):
 		""" returns dmodel based on cfg (number of layers and filter size)"""
-		model = tf.keras.Sequential(name="dmodel")
-		for i in range(cfg.HIDDEN_LAYERS):
-			single_layer = Conv2D(cfg.HIDDEN_FILTER_SIZE, 1, activation=tf.nn.relu)
-			model.add(single_layer)
+		input_shape = (cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.HIDDEN_FILTER_SIZE)
+		input_layer = tf.keras.Input(shape=input_shape)
+		previous_layer = input_layer
+		for i in range(cfg.MODEL.HIDDEN_LAYERS):
+			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 1, activation=None)(previous_layer)
 
-		final_layer = Conv2D(self.channel_n, 1, activation=None,
-						 kernel_initializer=tf.zeros_initializer)
-		model.add(final_layer)
+			if cfg.MODEL.SKIP_CONNECTIONS:
+				current_layer = tf.keras.layers.Add(name=f"skip_connection_{i}")([current_layer, previous_layer])
+
+			if cfg.MODEL.BATCH_NORM:
+				current_layer = tf.keras.layers.BatchNormalization()(current_layer)
+
+			current_layer = tf.keras.layers.ReLU()(current_layer)
+			previous_layer = current_layer
+
+
+		if cfg.MODEL.LAST_LAYER_INIT == "ZEROS":
+			final_layer = Conv2D(self.channel_n, 1, activation=None, kernel_initializer=tf.zeros_initializer)(previous_layer)
+		else:
+			final_layer = Conv2D(self.channel_n, 1, activation=None)(previous_layer)
+
+		model = tf.keras.models.Model(name="dmodel", inputs=input_layer, outputs=final_layer)
+
 		return model
 
-	# @call is like tf.function(call), but nicer
-	# tf function: "compiles a function into a callable TF graph"
-	# call is just one simulation step?
+	# TODO this does't even make a difference, so just remove it?
 	@tf.function
 	def call(self, x, fire_rate=None, manual_noise=None):
 		env, state = tf.split(x, [self.env_size, self.channel_n], -1)
@@ -94,16 +94,18 @@ class CAModel(tf.keras.Model):
 			fire_rate = self.fire_rate
 		update_mask = tf.random.uniform(tf.shape(x[:, :, :, :1])) <= fire_rate
 
+		# tf.print("state type", type(state))
 		# TODO tested for env of size 1, this is hotfix to make it work for RGB
 		# For now I don't need it. In case of Emoji growing, its 0
-		if cfg.MODEL_TASK == "classify":
+		if cfg.WORLD.TASK["TASK"] == "classify":
 			living_mask = tf.math.reduce_sum(env, -1, keepdims=True) > 0.1
-		elif cfg.MODEL_TASK == "growing":
-			# TODO Include living mask. But not like this, as it will never update
-			# surrounding pixels. >= 0 just sets all 1
-			# It would have to create a neighberhood for alive pixels to say which pixel
-			# is alive and which is not, which is a little more effort
-			living_mask = tf.math.reduce_sum(x[:,:,:,:3], -1, keepdims=True) >= 0
+		elif cfg.WORLD.TASK["TASK"] == "growing":
+			# TODO how does env play into the living mask?
+			if cfg.WORLD.LIVING_MASK:
+				living_mask = self.get_living_mask(state)
+			else:
+				living_mask = tf.constant(1)
+			# living_mask = tf.math.reduce_sum(x[:,:,:,:3], -1, keepdims=True) >= 0
 			# living_mask = tf.math.reduce_sum(x[:,:,:,:3], -1, keepdims=True) > 0.1
 		else:
 			raise ValueError()
@@ -111,28 +113,36 @@ class CAModel(tf.keras.Model):
 		residual_mask = update_mask & living_mask
 		ds *= tf.cast(residual_mask, tf.float32)
 		state += ds
+
 		return tf.concat([env, state], -1)
 
-	@tf.function
+	# @tf.function
 	def initialize(self, images):
 		""" Expands Image with channel_n dim, filled with 0s """
 		state = tf.zeros([tf.shape(images)[0], 28, 28, self.channel_n])
 		images = tf.reshape(images, [-1, 28, 28, 1])
 		return tf.concat([images, state], -1)
 
-	@tf.function
+	# @tf.function
 	def classify(self, x):
 		""" Not perse classification, depends on the task. Returns lossable channels """
-		if cfg.MODEL_TASK == "classify":
+		if cfg.WORLD.TASK["TASK"] == "classify":
 			# The last 10 layers are the classification predictions, one channel
 			# per class. Keep in mind there is no "background" class,
 			# and that any loss doesn't propagate to "dead" pixels.
 			return x[:,:,:,-10:]
-		elif cfg.MODEL_TASK == "growing":
-			# First 3 Channels are RGB
-			return x[:,:,:,:3]
+		elif cfg.WORLD.TASK["TASK"] == "growing":
+			# First 4 Channels are RGBA
+			return x[:,:,:,:4]
 		else:
-			raise ValueError(f"Task: {cfg.MODEL_TASK} not implemented")
+			raise ValueError(f"Task: {cfg.WORLD.TASK['TASK']} not implemented")
+
+	# TODO not a tf function -> because of indexing I think
+	@tf.function
+	def get_living_mask(self, x):
+		alpha = x[:, :, :, 3:4]
+		return tf.nn.max_pool2d(alpha, 3, [1, 1, 1, 1], 'SAME') > 0.1
+
 
 	def summary(self):
 		print("perceive: ", self.perceive.summary())
@@ -145,9 +155,9 @@ class CAModel(tf.keras.Model):
 		self.save_weights(path)
 
 		cf = self.call.get_concrete_function(
-				x=tf.TensorSpec([None, None, None, cfg.CHANNEL_N+1]),
+				x=tf.TensorSpec([None, None, None, cfg.MODEL.CHANNEL_N+1]),
 				fire_rate=tf.constant(0.5),
-				manual_noise=tf.TensorSpec([None, None, None, cfg.CHANNEL_N]))
+				manual_noise=tf.TensorSpec([None, None, None, cfg.MODEL.CHANNEL_N]))
 		cf = convert_to_constants.convert_variables_to_constants_v2(cf)
 		graph_def = cf.graph.as_graph_def()
 		graph_json = MessageToDict(graph_def)

@@ -20,9 +20,14 @@ import PIL.Image, PIL.ImageDraw
 from IPython.display import Image
 import moviepy.editor as mvp
 
-
 import matplotlib.pyplot as plt
 from visdom import Visdom
+
+# For loading and saving
+import os
+import json
+import pickle 
+from datetime import datetime
 
 total_time_dict = {}
 
@@ -31,33 +36,34 @@ def get_auto_title():
 	""" generates automatic title based on config """
 	pass
 
-def get_compact_title_str():
+def get_cfg_infos():
 	""" creates small ish title str with important informations """
-	full_str = f"CN:{cfg.CHANNEL_N},HFS:{cfg.HIDDEN_FILTER_SIZE},HL:{cfg.HIDDEN_LAYERS}," +\
-				f"BS:{cfg.BATCH_SIZE},SR:{cfg.CA_STEP_RANGE},MT:{cfg.MODEL_TYPE}"
+	full_str = str(cfg.WORLD.__dict__) + str(cfg.MODEL.__dict__) + \
+						 str(cfg.TRAIN.__dict__) + str(cfg.EXTRA.__dict__)
 	return full_str
+	# return full_str
 
 # Wrapper to time functions
 # TODO save times of methods to some outside arary to look at later
 def timeit(method):
-  if not cfg.USE_TIMER:
-    def wrapper(*args, **kwargs):
-      return method(*args, **kwargs)
-  else:
-    def wrapper(*args, **kwargs):
-      start = time.time()
-      result = method(*args, **kwargs)
-      total = time.time() - start
+	if not cfg.EXTRA.USE_TIMER:
+		def wrapper(*args, **kwargs):
+			return method(*args, **kwargs)
+	else:
+		def wrapper(*args, **kwargs):
+			start = time.time()
+			result = method(*args, **kwargs)
+			total = time.time() - start
 
 
-      # Add to list of times 
-      if not method.__name__ in total_time_dict.keys():
-      	total_time_dict[method.__name__] = []
-      total_time_dict[method.__name__].append(total)
+			# Add to list of times 
+			if not method.__name__ in total_time_dict.keys():
+				total_time_dict[method.__name__] = []
+			total_time_dict[method.__name__].append(total)
 
-      # print(f"Execution time of {method.__name__} ", total)
-      return result
-  return wrapper
+			# print(f"Execution time of {method.__name__} ", total)
+			return result
+	return wrapper
 
 
 # Visdom stuff
@@ -94,6 +100,7 @@ def color_labels(x, y_pic, disable_black=False, dtype=tf.uint8):
 		# this ensures that you don't draw white in the digits.
 		is_not_gray += is_gray
 
+	# TODO Background white thingy...
 	bnw_order = [is_gray, is_not_gray] if cfg.BACKGROUND_WHITE else [is_not_gray, is_gray]
 	black_and_white *= tf.stack(bnw_order, -1)
 
@@ -104,9 +111,6 @@ def color_labels(x, y_pic, disable_black=False, dtype=tf.uint8):
 		return tf.cast(rgb, tf.uint8)
 	else:
 		return tf.cast(rgb, dtype) / 255.
-
-
-
 
 
 # Todo what is that? -> I think just making the picture bigger
@@ -217,10 +221,91 @@ def make_run_videos(ca, num_steps, eval_bs, prefix, disable_black=False):
 			vid.add(np.uint8(im))
 
 
-def rgba_to_rgb(rgba_img):
-	''' Inverts alpha channel to add to rgb on white '''
-	rgb, a = rgba_img[...,:3], rgba_img[...,3:4]
-	return 1.0-a+rgb
+def load_full_save(date, time):
+	""" Returns class informations from pickle file from cfg.EXTRA.LOG_PATH + data + time """
+	full_path = cfg.EXTRA.LOG_PATH + date + "/" + time + "/"
+	if not os.path.isdir(full_path):
+		raise ValueError(f"Path : {full_path} does not exists")
+
+	all_class_instances = []
+	with open(full_path + "full_config.pkl", "rb") as f:
+		# Iterates through all cfg classes specified in cfg file
+		for config_name in cfg.ALL_CONFIG_CLASSES:
+			x = pickle.load(f)
+			# If loading old versions, this has to be removed manually!
+			assert type(x) == type(getattr(cfg, config_name)), f"{type(x)} of {x} not correct"
+			all_class_instances.append(x)
+	return all_class_instances
+
+
+# Todo not happy about placement, in utils would create double import?
+def get_session_id():
+	now = datetime.now()
+	now_date = f"{now.year}_{now.month:02d}_{now.day:02d}"
+	now_time = f"{now.hour:02d}_{now.minute:02d}_{now.second:02d}"
+	return now_date + "/" + now_time
+
+
+def read_json(filename):
+	with open(filename) as f:
+		data = json.load(f)
+	return data
+
+def save_cfg():
+	""" 
+	Saves all config objects in bytes and all changed information as jsons
+	At LOG_PATH + date + time
+	"""
+
+	# First path for date
+	cur_path = cfg.EXTRA.LOG_PATH + cfg.EXTRA.SESSION_ID.split("/")[0] + "/"
+	if not os.path.isdir(cur_path):
+		os.mkdir(cur_path)
+
+	# Ad second path for time
+	cur_path += cfg.EXTRA.SESSION_ID.split("/")[1] + "/"
+	os.mkdir(cur_path)
+
+	# Open and write into 'json' (not 100% json)
+	with open(cur_path + "diff.json", "w") as f:
+		for config_name in cfg.ALL_CONFIG_CLASSES:
+			f.write(f'{{"{config_name}":')
+			json.dump(getattr(cfg, config_name).__dict__, f)
+			f.write("}\n")
+
+	# Open and write into pickle file
+	with open(cur_path + "full_config.pkl", "wb") as f:
+		for config_name in cfg.ALL_CONFIG_CLASSES:
+			pickle.dump(getattr(cfg, config_name), f)
+
+	print("Successfully saved configs at: ", cur_path)
+
+
+def save_fig(fig, name="fig", as_json=True, as_img=False):
+	full_path = cfg.EXTRA.LOG_PATH + cfg.EXTRA.SESSION_ID + "/"
+
+	if as_json:
+		fig.write_json(full_path + name + ".json")
+
+	if as_img:
+		try:
+			fig.write_image(full_path + name + ".png")
+		except ValueError:
+			print("VALUE ERROR while writing the png")
+
+
+def get_all_figs(sess_id, name="fig_"):
+  path = cfg.EXTRA.LOG_PATH + "/" + sess_id + "/"
+  
+  all_files = os.listdir(path)
+  file_names = [file for file in all_files if name in file and "json" in file]
+  
+  figs = []
+  for file_name in file_names:
+    figs.append(read_json(path + file_name))
+    
+  return figs
+
 
 
 def create_js_drawing():

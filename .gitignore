@@ -3,3 +3,4 @@ train_log/
 .git/
 .ipynb_checkpoints/
 models/
+logs/

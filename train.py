@@ -28,36 +28,49 @@ class Trainer:
 		# Visdom for visualization
 		self.vis = vis
 
+		# mostly to set the shape, values will be overwirtten anyways
+		# TODO Variable does not really help, just makes it more complicated
+		self.x = tf.Variable(self.x_train[0:cfg.TRAIN.BATCH_SIZE], trainable=False)
+		self.y = tf.Variable(self.y_train[0:cfg.TRAIN.BATCH_SIZE], trainable=False)
 		# How much initial seeds used inside the pool, decreases after steps
 
-		self.seed_ratio = 1
+		# Set tf Variables
+		self.loss_log = []
+		self.seed_idx = tf.Variable(0, dtype=tf.int32)
+		self.seed_idx.assign(self.get_seed_idx())
+
+		# To set current number of ca steps
+		self.num_ca_steps = tf.Variable(0, dtype=tf.int32)
+
 		# Will be used if USE_PATTERN_POOL is true
 		self.batch = None
 
-		self.trainer = self.get_tf_trainer()
+		self.optimizer = self.get_tf_optimizer()
 		self.pool = self.get_pool()
 
-		# TODO remove for testing only
-		self.pool_t = np.repeat(self.x_train[0:1], 80, 0)
-		print("pool size ", self.pool_t.shape)
-		self.loss_log = []
+		# Get function to apply gradients
+		self.apply_grads = self.get_apply_grad_fn()
 
-	def get_tf_trainer(self):
-		# TODO globalize lr?
+		# TODO remove for testing only
+		self.pool_t = np.repeat(self.x_train[0:1], cfg.TRAIN.POOL_SIZE, 0)
+		# print("pool size ", self.pool_t.shape)
+
+
+	def get_tf_optimizer(self):
 		# TODO change lr/optimizer
-		lr = cfg.LR
+		lr = cfg.TRAIN.LR
 		lr_sched = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
 			[30000, 70000], [lr, lr*0.1, lr*0.01])
 		trainer = tf.keras.optimizers.Adam(lr)
 		return trainer
 
 	def get_pool(self):
-		if cfg.MODEL_TASK == "growing":
+		if cfg.WORLD.TASK["TASK"] == "growing":
 			# Use x,y directly as sample pool (always the same)
 			# x and y train are created for pool size
 			pool = datasets.SamplePool(x=self.x_train, y=self.y_train)
-		elif cfg.MODEL_TASK == "classify":
-			starting_indexes = np.random.randint(0, self.x_train.shape[0]-1, size=cfg.POOL_SIZE)
+		elif cfg.WORLD.TASK["TASK"] == "classify":
+			starting_indexes = np.random.randint(0, self.x_train.shape[0]-1, size=cfg.TRAIN.POOL_SIZE)
 			# pool is a Class defined in datasets
 			pool = datasets.SamplePool(x=self.ca.initialize(self.x_train[starting_indexes]).numpy(),
 						 y=self.y_train[starting_indexes])
@@ -71,12 +84,12 @@ class Trainer:
 
 	@utils.timeit
 	def get_new_x_y(self):
-		if cfg.MODEL_TASK == "classify":
+		if cfg.WORLD.TASK["TASK"] == "classify":
 			return self.get_new_mnist_x_y()
-		elif cfg.MODEL_TASK == "growing":
+		elif cfg.WORLD.TASK["TASK"] == "growing":
 			return self.get_new_emoji_x_y()
 		else:
-			raise ValueError(f"Task {cfg.MODEL_TASK}, not implemented")
+			raise ValueError(f"Task {cfg.WORLD.TASK['TASK']}, not implemented")
 
 
 	def cut_x(self, x):
@@ -132,68 +145,45 @@ class Trainer:
 		single emoji goal
 		"""
 		# TODO new minst/emoji likely can be fully merged
-		if cfg.USE_PATTERN_POOL:
+		if cfg.TRAIN.USE_PATTERN_POOL:
 
 			# TODO currently these idx will be replaced with inits from init seed/
 			# cuts and then put into the original pool
-			self.batch_idx = np.random.choice(len(self.pool_t), cfg.BATCH_SIZE, replace=False)
-			x0 = self.pool_t[self.batch_idx]
+			self.batch_idx = np.random.choice(len(self.pool_t), cfg.TRAIN.BATCH_SIZE, replace=False)
 			
-			# Keep one seed 
-			# np copy should not be needed
-			# x0[0] = np.copy(self.x_train[0])
-			y0 = np.copy(self.y_train[0:cfg.BATCH_SIZE])
-			# return x0, y0
-
-			# Sample full Batch of pool samples
-			# self.batch = self.pool.sample(cfg.BATCH_SIZE)
-			# TODO np.copy needed? -> should not be needed 
-			# x0 = np.copy(self.batch.x)
-			#y0 = self.batch.y
+			x0 = np.copy(self.pool_t[self.batch_idx])
+			y0 = np.copy(self.y_train[0:cfg.TRAIN.BATCH_SIZE])
 
 			# Based on number of steps set amount to pure seeds
-			seed_idx = int(np.around(cfg.BATCH_SIZE*self.seed_ratio))
-			x0[0:seed_idx] = self.x_train[0:seed_idx]
-			
-			# return x0, y0
-			
-			# Initialize the first q_bs images with normal starting seeds,
-			# new_idx = self.get_random_train_idx(size=q_bs)
-			# x0[:q_bs] = self.x_train[new_idx]
-			# Not needed as y never changes
-			# y0[:q_bs] = self.y_train[new_idx]
+			x0[0:self.seed_idx.numpy()] = self.x_train[0:self.seed_idx.numpy()]
 
-			# Again, but x not initialized
-			# new_idx = self.get_random_train_idx(size=q_bs)
-			# new_x, new_y = self.x_train[new_idx], self.y_train[new_idx]
-
-			if cfg.MUTATE_POOL:
+			if cfg.TRAIN.MUTATE_POOL:
 				# 1/4th destroyed pictures
-				q_bs = cfg.BATCH_SIZE // 4
+				q_bs = cfg.TRAIN.BATCH_SIZE // 4
 
 				# Randomly removes part of the image for the last 1/4th elements
 				x0[-q_bs:] = self.cut_x(x0[-q_bs:])
 			# No else path needed as pool values already assigned
 		else:
 			# Initial most simple configuration -> Fill all of x0 with new x_train imgs.
-			x0 = self.x_train[0:cfg.BATCH_SIZE]
-			y0 = self.y_train[0:cfg.BATCH_SIZE]
+			x0 = self.x_train[0:cfg.TRAIN.BATCH_SIZE]
+			y0 = self.y_train[0:cfg.TRAIN.BATCH_SIZE]
 		return x0, y0
 
 
 	def get_new_mnist_x_y(self):
 		# Pattern Pool depends on the Model type (starting with very simple (False, False) Model) 
-		if cfg.USE_PATTERN_POOL:
+		if cfg.TRAIN.USE_PATTERN_POOL:
 			# Use the same pool for training, but replace 1/2 of the images with random images
 			# from the training set. First Fourth normal random, last fourth maybe mutated in a weird
 			# way.
-			self.batch = self.pool.sample(cfg.BATCH_SIZE)
+			self.batch = self.pool.sample(cfg.TRAIN.BATCH_SIZE)
 			x0 = np.copy(self.batch.x)
 			y0 = self.batch.y
 
 			# we want half of them new. We remove 1/4 from the top and 1/4 from the
 			# bottom.
-			q_bs = cfg.BATCH_SIZE // 4
+			q_bs = cfg.TRAIN.BATCH_SIZE // 4
 
 			# Initialize the first q_bs images with random x images
 			new_idx = self.get_random_train_idx(size=q_bs)
@@ -204,7 +194,7 @@ class Trainer:
 			new_idx = self.get_random_train_idx(size=q_bs)
 			new_x, new_y = self.x_train[new_idx], self.y_train[new_idx]
 
-			if cfg.MUTATE_POOL:
+			if cfg.TRAIN.MUTATE_POOL:
 				# Mask with x to 0/1 via booleans 1 if > 0.1
 				new_x = tf.reshape(new_x, [q_bs, 28, 28, 1])
 				mutate_mask = tf.cast(new_x > 0.1, tf.float32)
@@ -224,31 +214,10 @@ class Trainer:
 				y0[-q_bs:] = new_y
 		else:
 			# Initial most simple configuration -> Fill all of x0 with new x_train imgs.
-			b_idx = self.get_random_train_idx(size=cfg.BATCH_SIZE)
+			b_idx = self.get_random_train_idx(size=cfg.TRAIN.BATCH_SIZE)
 			x0 = self.ca.initialize(self.x_train[b_idx])
 			y0 = self.y_train[b_idx]
 		return x0, y0
-
-	@utils.timeit
-	@tf.function
-	def update_step(self, x, y):
-		# DO iter_n steps internally, then update and apply losses.
-		with tf.GradientTape() as g:
-			# Selecting a random amount of steps from a list
-			# Using a star unpacks the list
-			num_ca_steps = np.random.randint(*cfg.CA_STEP_RANGE)
-			for i in tf.range(num_ca_steps):
-				# Single ca step
-				x = self.ca(x)
-			# TODO outsource to selectable loss function
-			loss = self.batch_l2_loss(x, y)
-		grads = g.gradient(loss, self.ca.weights)
-		# LAYER_NORM will normalize over a single layer + batch, similar effect
-		# As weigth normalization after applying the update
-		if cfg.LAYER_NORM:
-			grads = [g/(tf.norm(g)+1e-8) for g in grads]
-		self.trainer.apply_gradients(zip(grads, self.ca.weights))
-		return x, loss
 
 	@utils.timeit
 	def full_train_step(self):
@@ -257,25 +226,23 @@ class Trainer:
 		# Get current x0, y0 dependent on the model configs/task
 		x0, y0 = self.get_new_x_y()
 
-		# Very much needed! Bad luck or it just won't train as I tested
-		x = np.copy(x0)
+		# This is needde as x and y are tf.Variables, does not actually faster sadly
+		self.x.assign(x0)
+		self.y.assign(y0)
 
-		# Runs ca for ca_num_steps and applies gradients, returns new x
-		x, loss = self.update_step(x, y0)
+		self.num_ca_steps.assign(np.random.randint(*cfg.WORLD.CA_STEP_RANGE))
 
-		# TODO hotfix!
-		# self.pool_t[self.batch_idx] = x
+		x, losses = self.apply_grads(self.x, self.y)
+		# x, loss = self.update_step(x, y0, seed_idx)
 
-		# Not nice, applying updates to the pool if specific model configs are set
-		# TODO use? if len(self.loss_log) > 501:
 		self.post_train_step(x, y0)
 
-		self.loss_log.append(loss.numpy())
+		self.loss_log.append([x.numpy() for x in losses])
 		# Not sure about returning here or saving locally
-		return x0, x, loss
+		return x0, x, losses
 
 	@utils.timeit
-	def visualize(self, x0, x, loss):
+	def visualize(self, x0, x, loss, run_id=0):
 		""" Check current step and visualize current results """
 		step_i = len(self.loss_log)
 
@@ -288,11 +255,11 @@ class Trainer:
 			# And I am unable to see anything
 			# disp.visualize_batch(self.ca, x0, x, step_i)
 			disp.clear()
-			disp.plot_loss(self.loss_log)
-			pass
+			disp.plot_losses(self.loss_log)
+			# pass
 
 		# Viz current pool
-		if cfg.USE_PATTERN_POOL and step_i%100 == 0:
+		if cfg.TRAIN.USE_PATTERN_POOL and step_i%100 == 0:
 			pass
 			# TODO
 			# utils.generate_pool_figures(self.ca, self.pool, step_i)
@@ -302,38 +269,56 @@ class Trainer:
 			self.save_model()
 
 		# Simple print to show progress, will be overwritten in each step
-		print('\r step: %d, log10(loss): %.3f'%(step_i, np.log10(loss)), end='')
+		print('\r r: %d step: %d, full_loss: %.3f'%(run_id, step_i, loss[0]), end='')
 		
 		# 
 		# disp.show(str('step: %d, log10(loss): %.3f'%(step_i, np.log10(loss))))
 		# print(step_i)
 
-	def scatter_simple(self, title=utils.get_compact_title_str()):
+	def scatter_simple(self, title=utils.get_cfg_infos()):
 		disp.vis_scatter(self.vis, np.array(self.loss_log), title)
 
+	def visdom_loss(self):
+		fig = disp.plot_loss(self.loss_log, return_plot=True)
+		disp.visdom_plotly(self.vis, fig)
 
 	def reset(self):
 		""" Resseting current progress, resseting ca, etc. """
+		tf.keras.backend.clear_session()
 		self.loss_log = []
-		self.ca = models.CAModel()
+		# self.__init__(self.x_train, self.y_train, self.ca, self.vis)
 
-	# TODO super ugly here...
+	def get_seed_idx(self):
+		""" Updates current seed to pool ratio and current idx"""
+
+		if cfg.TRAIN.FIXED_SEED_RATIO:
+			seed_ratio = cfg.TRAIN.FIXED_SEED_RATIO
+		else:
+			# Update seed ratio
+			seed_ratio = 1.
+
+			if len(self.loss_log) > 100:
+				seed_ratio = 0.9
+			if len(self.loss_log) > 300: # old: 500
+				seed_ratio = 0.5
+			if len(self.loss_log) > 500: # old: 1000
+				# to leave 1 sample in the batch as init seed:
+				seed_ratio = 1/cfg.TRAIN.BATCH_SIZE
+
+		assert cfg.TRAIN.BATCH_SIZE * seed_ratio >= 1, "too small seed ratio"
+
+		return int(np.around(cfg.TRAIN.BATCH_SIZE * seed_ratio))
+
 	def post_train_step(self, x, y0):
 		# TODO more complicated for mnist
-		# TODO outsource
 
 		# Update seed ratio
-		if len(self.loss_log) > 100:
-			self.seed_ratio = 0.9
-		if len(self.loss_log) > 300: # old: 500
-			self.seed_ratio = 0.5
-		if len(self.loss_log) > 600: # old: 1000
-			# to leave 1 sample in the batch as init seed:
-			self.seed_ratio = 1/cfg.BATCH_SIZE
+		self.seed_idx.assign(self.get_seed_idx())
 
-		assert cfg.BATCH_SIZE * self.seed_ratio >= 1, "too small seed ratio"
-
-		self.pool_t[self.batch_idx] = x
+		# Force pool values to be inside range (-1,1)
+		if cfg.TRAIN.POOL_TANH:
+			x = tf.math.tanh(x)
+		self.pool_t[self.batch_idx] = x.numpy()
 
 		# if cfg.USE_PATTERN_POOL:
 		# 			self.pool.update()
@@ -341,40 +326,58 @@ class Trainer:
 		# 	self.batch.y[:] = y0 # Not needed in growing, but for classificiation
 		# 	self.batch.commit()
 
+	# @tf.function
 	def individual_l2_loss(self, x, y):
 		""" Creates loss, fitting to task """
 		t = y - self.ca.classify(x)
 		return tf.reduce_sum(t**2, [1, 2, 3]) / 2
 
+	# @tf.function
 	def batch_l2_loss(self, x, y):
 		return tf.reduce_mean(self.individual_l2_loss(x, y))
 
+	# I think they get automatically converted if possible, thus decorator does nothing
+	def get_losses(self, x, y):
+		""" Returns configured loss for model, if grad is true only the total loss 
+			loss at [0] is always the total loss used for gradients """
+		
+		loss = []
+		if cfg.TRAIN.LOSS_TYPE == "l2":
+			seed_loss = self.batch_l2_loss(x[:self.seed_idx], y[:self.seed_idx])
+			if self.seed_idx < cfg.TRAIN.BATCH_SIZE:
+				pool_loss = self.batch_l2_loss(x[self.seed_idx:], y[self.seed_idx:])
+			else:
+				pool_loss = float('NaN')
+			full_loss = self.batch_l2_loss(x,y)
+			loss = [full_loss, seed_loss, pool_loss]
 
-	# By me:
-	def single_run(ca, num_steps, prefix, disable_black=True):
-		raise NotImplementedError("Not yet tested after reordering")
-		# Initiialize with single random index from train data
-		new_idx = np.random.randint(0, x_train.shape[0]-1)
-		x = ca.initialize(np.expand_dims(x_train[new_idx,:,:], 0))
-		# TODO where 20 come from?
-		frames = []
-		with utils.VideoWriter(prefix + ".mp4") as vid:
-					# tqdm is progress
-			for i in tqdm.trange(-1, num_steps):
-				if i == -1:
-					image = utils.classify_and_show(ca, x, False)
-				else:
-					x = ca(x)
-					image = utils.classify_and_show(ca, x, disable_black)
-				# vis_extended = np.concatenate((image, np.ones((86, image.shape[1], 3))), axis=0) 
-				im = np.uint8(image*255)
-				im = PIL.Image.fromarray(im)
-				# not needed
-				# im.paste(slider, box=(0, image.shape[0]+20))
-				draw = PIL.ImageDraw.Draw(im)
-				# p_x = 3+(((image.shape[1]-5-3)/num_steps)*i)
-				# draw.rectangle([p_x, image.shape[0]+21, p_x+5, image.shape[0]+42], fill="#434343bd")
-			vid.add(np.uint8(im))
+		return loss	
+
+
+	def get_apply_grad_fn(self):
+		""" Wrapper for apply grad, needed to run several times without resetting """
+
+		@tf.function
+		def apply_grad(x, y):
+
+			with tf.GradientTape() as g:
+				# TODO tf range is actually slower than writing it out...
+				for i in tf.range(self.num_ca_steps):
+					x = self.ca(x)
+
+				# TODO is there a better way?
+				losses = self.get_losses(x, y)
+
+			grads = g.gradient(losses[0], self.ca.trainable_variables)
+
+			# LAYER_NORM will normalize over a single layer + batch, similar effect
+			# As weigth normalization after applying the update
+			if cfg.TRAIN.LAYER_NORM:
+				grads = [g/(tf.norm(g)+1e-8) for g in grads]
+			self.optimizer.apply_gradients(zip(grads, self.ca.trainable_variables))
+			return x, losses
+		return apply_grad
+
 
 # TODO not used but in original code, not sure for what...
 """
