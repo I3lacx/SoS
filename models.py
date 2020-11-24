@@ -35,11 +35,6 @@ class CAModel(tf.keras.Model):
 		self.add_noise = add_noise
 		self.env_size = env_size
 
-		self.perceive = tf.keras.Sequential([
-					tf.keras.Input(shape=(cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)),
-					Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=tf.nn.relu, padding="SAME"),
-			], name="perceive")  # 80 filters, why 80?
-
 		self.dmodel = self.get_dmodel()
 
 		# Input Layer this works, zeroes would also work
@@ -48,9 +43,14 @@ class CAModel(tf.keras.Model):
 
 	def get_dmodel(self):
 		""" returns dmodel based on cfg (number of layers and filter size)"""
-		input_shape = (cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.HIDDEN_FILTER_SIZE)
+		input_shape = (cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)
 		input_layer = tf.keras.Input(shape=input_shape)
-		previous_layer = input_layer
+		
+		current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=tf.nn.relu,
+								padding="SAME", name="perceive")(input_layer)
+
+
+		previous_layer = current_layer
 		for i in range(cfg.MODEL.HIDDEN_LAYERS):
 			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 1, activation=None)(previous_layer)
 
@@ -69,16 +69,44 @@ class CAModel(tf.keras.Model):
 		else:
 			final_layer = Conv2D(self.channel_n, 1, activation=None)(previous_layer)
 
+		if cfg.MODEL.UPDATE_GATE:
+			# Sigmoid because it has to be between 0 and 1
+			w = Conv2D(1, 1, activation="sigmoid", name="update_gate")(input_layer)
+			w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="w"))(w)
+			# TODO find more elegant solution:
+			# self.update_gate = w
+
+			# tf.print(w.numpy())
+			one = tf.ones_like(w, dtype=tf.float32)
+			l1 = tf.keras.layers.multiply([w, input_layer])
+			negated_w = tf.keras.layers.Add()([one, tf.math.negative(w)])
+			negated_w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="neg_w"))(negated_w)
+			# print(negated_w)
+			
+			# TODO not prefered option, this just changes the update, but otherwise val gets too high too quick!
+			final_layer = tf.keras.layers.multiply([negated_w, final_layer])
+
+			if cfg.MODEL.SET_WORLD_STATE:
+				# This will add l1 to final layer and thus is setting the world state
+				final_layer = tf.keras.layers.Add(name="Super_skip_layer")([l1, final_layer])
+			# final_layer = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="final_layer"))(final_layer)
+
 		model = tf.keras.models.Model(name="dmodel", inputs=input_layer, outputs=final_layer)
 
 		return model
 
 	# TODO this does't even make a difference, so just remove it?
-	@tf.function
+	# @tf.function
 	def call(self, x, fire_rate=None, manual_noise=None):
 		env, state = tf.split(x, [self.env_size, self.channel_n], -1)
 
-		ds = self.dmodel(self.perceive(x))
+		ds = self.dmodel(x)
+
+		# if cfg.MODEL.KEEP_OLD_STATE:
+			# dmodel is its first and only layer...
+			#tf.print(self.layers[0].get_layer("update_gate").output)
+
+
 
 		#if cfg.MODEL_TASK == "growing":
 		#	return x + self.test(x)
@@ -111,8 +139,18 @@ class CAModel(tf.keras.Model):
 			raise ValueError()
 
 		residual_mask = update_mask & living_mask
-		ds *= tf.cast(residual_mask, tf.float32)
-		state += ds
+
+		# Directly assign the world state instead of updating it
+		if cfg.MODEL.SET_WORLD_STATE:
+			# In order to apply the mask, only the active channels will be updated
+			# TODO this is a np operation, which should be converted to a tf operation, but not tested!
+			# This will update all values in state where mask is True and set values to ds
+			state = tf.where(residual_mask, ds, state)
+			# np.putmask(state, residual_mask, ds)
+			# state = ds
+		else:
+			ds *= tf.cast(residual_mask, tf.float32)
+			state += ds
 
 		return tf.concat([env, state], -1)
 
@@ -122,6 +160,14 @@ class CAModel(tf.keras.Model):
 		state = tf.zeros([tf.shape(images)[0], 28, 28, self.channel_n])
 		images = tf.reshape(images, [-1, 28, 28, 1])
 		return tf.concat([images, state], -1)
+
+
+	def print_layer(self, x, text):
+		# TODO config to enable/disable print
+		if cfg.EXTRA.PRINT_LAYER:
+			tf.print(text, x.shape, tf.math.reduce_min(x), tf.math.reduce_mean(x), tf.math.reduce_max(x))
+		# tf.print(tf.math.reduce_max(x))
+		return x
 
 	# @tf.function
 	def classify(self, x):
@@ -137,7 +183,6 @@ class CAModel(tf.keras.Model):
 		else:
 			raise ValueError(f"Task: {cfg.WORLD.TASK['TASK']} not implemented")
 
-	# TODO not a tf function -> because of indexing I think
 	@tf.function
 	def get_living_mask(self, x):
 		alpha = x[:, :, :, 3:4]
@@ -145,7 +190,7 @@ class CAModel(tf.keras.Model):
 
 
 	def summary(self):
-		print("perceive: ", self.perceive.summary())
+		# print("perceive: ", self.perceive.summary())
 		print("------------")
 		print("dmodel: ", self.dmodel.summary())
 

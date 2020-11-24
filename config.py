@@ -46,6 +46,9 @@ class _Model(_ConfigModule):
 	SKIP_CONNECTIONS = False
 	LAST_LAYER_INIT = "ZEROS"
 	BATCH_NORM = False
+	UPDATE_GATE = False
+
+	SET_WORLD_STATE = False 	# on True this will not apply state += ds, but rather state = ds to the world state
 
 	def __init__(self, params={}):
 		super().__init__(params)
@@ -58,20 +61,24 @@ class _Model(_ConfigModule):
 class _Training(_ConfigModule):
 	""" Parameters for the Training configuration """
 
-	NUM_TRAINING_STEPS = 1000 	# TODO not used I think
+	NUM_TRAIN_STEPS = 2000 	# TODO this value will be overwritten in notbeook, not nice...
 	BATCH_SIZE = 8
 	POOL_SIZE = BATCH_SIZE * 10,
-	FIXED_SEED_RATIO = None		# Fixing the seed ratio to float: (0,1] 
+	FIXED_SEED_RATIO = 1/8		# Fixing the seed ratio to float: (0,1] 
 
 	POOL_TANH = False # Force pool values between (-1,1)
 
-	# TRAINING_TYPE: '3', # Before: Model type
-	# TODO conversion not here?
+	""" Ratio of how long to initialize a warm up until the actual ratios kick in
+		0 for no warm up, otherwise value between [0,1] How much of total steps """
+	WARM_UP = 0
+
 	USE_PATTERN_POOL =  True
-	MUTATE_POOL = True
+	MUTATE_POOL = False # 12.11 changed from True to False
+
+	USE_Y_POOL = False	# Added option at 16.11
 
 	LOSS_TYPE = "l2"
-	ADD_NOISE = True # TODO used? -> I think first for MNIST
+	ADD_NOISE = True # TODO YOS THIS IS USED DURING EACH CALL
 	LR = 1e-3
 	LAYER_NORM = True
 
@@ -88,6 +95,7 @@ class _Extra(_ConfigModule):
 	USE_TIMER = True
 	LOG_PATH = "logs/maybe/"
 	SESSION_ID = None
+	PRINT_LAYER = False
 
 	def __init__(self, params={}):
 		super().__init__(params)
@@ -95,9 +103,9 @@ class _Extra(_ConfigModule):
 
 # Calls and creates all config objects, to be called after importing the module
 # Session Id is set here to make it easier to recognize plots as they all have the id now.
-world_dict = {"TASK": {"TASK":"growing", "TARGET":"double_exclamation_mark", "SIZE":20}, "SIZE":50}
-model_dict = {}
-train_dict = {"POOL_TANH": True, "MUTATE_POOL": False, "FIXED_SEED_RATIO": 1/8}
+world_dict = {}
+model_dict = dict()
+train_dict = dict()
 extra_dict = {"SESSION_ID": utils.get_session_id()}
 
 WORLD = _World(world_dict)

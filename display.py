@@ -15,6 +15,9 @@ from IPython.display import Image, HTML, clear_output, Video, display
 import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
+import plotly
 
 
 class VideoWriter:
@@ -66,7 +69,7 @@ def clear():
 def show(obj):
 	display(obj)
 
-def plot_loss(loss_log, log_scale=True, return_plot=False, plot_mean=True, name="", smoothed=0):
+def plot_loss(loss_log, log_scale=False, return_plot=False, plot_mean=True, name="", smoothed=0, title=""):
 	""" Plot loss with plotly """
 	# TODO plot only the mean if there are too many points -> performance
 
@@ -75,10 +78,24 @@ def plot_loss(loss_log, log_scale=True, return_plot=False, plot_mean=True, name=
 		# smoothed_y = np.convolve(kernel, loss_log, 'valid')
 		# smoothed_y = np.insert(smoothed_y, 0, loss_log[0])
 		smoothed_y = smooth(loss_log, weight=smoothed)
-		return go.Scatter(y=smoothed_y, name=str(name+"_s"))
+		fig = go.Scatter(y=smoothed_y, name=str(name+"_s"))
+	else:
+		fig = go.Scatter(y=loss_log, name=str(name))
 
-	# TODO currently just this single thing...
-	return go.Scatter(y=loss_log, name=name, opacity=0.4, visible="legendonly")
+	if return_plot:
+		return fig
+
+	plot = go.Figure(fig)
+
+	if name:
+		plot.update_layout(title=title)
+	if log_scale:
+		plot.update_yaxes(type="log")
+
+	plot.show()
+
+	# TODO i think this can be removed: Old conv filter
+	"""
 	# Create mean plot with line
 	# basically a smoothing value higher -> more smooth
 	step_size = 5
@@ -106,6 +123,7 @@ def plot_loss(loss_log, log_scale=True, return_plot=False, plot_mean=True, name=
 	# Show figure
 	fig.show()
 	# TODO log_scale
+	"""
 
 
 # TODO does not seem suuper efficient -> also should be in utils not in display
@@ -141,7 +159,7 @@ def plot_losses(loss_logs, log_scale=False, return_plot=False, plot_mean=True, s
 	names = ["total", "seed", "pool"]
 	for i in range(np.shape(loss_logs)[1]):
 		trace = plot_loss(loss_logs[:,i], return_plot=True, plot_mean=False, name=names[i])
-		smooth = plot_loss(loss_logs[:,i], name=names[i], smoothed=smoothing_weight)
+		smooth = plot_loss(loss_logs[:,i], return_plot=True, name=names[i], smoothed=smoothing_weight)
 		fig.add_trace(trace)
 		fig.add_trace(smooth)
 
@@ -205,8 +223,11 @@ def visualize_batch(ca, x0, x, step_i):
 		# imwrite('train_log/batches_%04d.jpg'%step_i, vis)
 		print('batch (before/after):')
 	elif cfg.WORLD.TASK["TASK"] == "growing":
-		# Classify in growing, returns RGB layers
-		vis = np.hstack(ca.classify(x))
+		# Classify in growing, returns RGBA layers
+		vis_x = np.hstack(ca.classify(x))
+		vis_x0 = np.hstack(ca.classify(x0))
+		print(vis_x.shape)
+		vis = np.vstack([vis_x0, vis_x])
 	else:
 		raise ValueError()
 
@@ -233,7 +254,7 @@ def vis_scatter(vis, x, title):
 	vis.scatter(z, opts=opts)
 
 
-def avg_plot(figs, idx, name, return_plot=True):
+def avg_plot(figs, idx, name, return_plot=True, showlegend=True, color=None):
 	""" calculates mean and std from a single index from figs """
 	figs_mean = np.mean([fig["data"][idx]["y"] for fig in figs], axis=0)
 	figs_std = np.std([fig["data"][idx]["y"] for fig in figs], axis=0)
@@ -244,15 +265,20 @@ def avg_plot(figs, idx, name, return_plot=True):
 	figs_y_lower = figs_mean - figs_std
 	figs_y = np.concatenate((figs_y_upper, figs_y_lower[::-1]))
 
-	mean_plot = go.Scatter(y=figs_mean, name=name+"_mean")
-	std_plot = go.Scatter(x=figs_x, y=figs_y, name=name+"_std", fill='toself')
+	std_marker_color = "rgba(100, 30, 150, 0.5)"
+	# Using legendgroup will merge plots on a huge subplotplot level
+	mean_plot = go.Scatter(y=figs_mean, name=name+"_mean", legendgroup=name+"_mean", showlegend=showlegend, marker_color=color)
+	std_plot = go.Scatter(x=figs_x, y=figs_y, name=name+"_std", fill='toself', legendgroup=name+"_std", showlegend=showlegend, marker_color=color, fillcolor=color, opacity=0.5)
+
+	# std_plot.update_traces(marker_opacity=0.5)
+
 	if return_plot:
 		return mean_plot, std_plot
 	else:
 		go.Figure([mean_plot, std_plot]).show()
 
 
-def plot_avg_session(sess_id, title=""):
+def plot_avg_session(sess_id, title="", showlegend=True):
 	""" gets all avg plots from data_idx (realated to lossos)"""
 	figs = utils.get_all_figs(sess_id)
 
@@ -262,16 +288,42 @@ def plot_avg_session(sess_id, title=""):
 	if title == "":
 		# TODO this is disgusting code
 		with open(cfg.EXTRA.LOG_PATH + sess_id + "/diff.json") as f:
-			file_arr = f.read().split("\n", "")
+			file_arr = f.read().split("\n")
 
-		for i in range(len(file_str)):
+		for i in range(len(file_arr)):
   			title += file_arr[i][9:-1]
+
+	color_arr = plotly.colors.DEFAULT_PLOTLY_COLORS
+	# color_arr = plotly.colors.sequential.Plasma[::3]
 
 	fig = go.Figure()
 	for idx,val in enumerate(data_idx):
-		mean_plot, std_plot = avg_plot(figs, val, names[idx])
+		mean_plot, std_plot = avg_plot(figs, val, names[idx], showlegend=showlegend, color=color_arr[idx])
 		fig.add_trace(mean_plot)
 		fig.add_trace(std_plot)
 		fig.layout.title.text = "<br>".join(textwrap.wrap(title, width=120))
 		fig.layout.title.font.size = 12
 	return fig
+
+def plot_collection_of_avg_plots(plots, render_in_browser=True):
+	""" Plots a collection of avergae plots from dict of plot ids from plots
+		This function is not generalized! """
+
+	# This will default all coming rendering of plotly to the browser!
+	if render_in_browser:
+		pio.renderers.default = "browser"
+
+	fig = make_subplots(rows=4, cols=4, x_title="HIDDEN_FILTER_SIZE [16,128]", y_title="CHANNEL_N [8,64]")
+
+	for idx, key in enumerate(plots.keys()):
+		if idx == 0:
+			plot = plot_avg_session(key, showlegend=True).data
+		else:
+			plot = plot_avg_session(key, showlegend=False).data
+
+		fig.add_traces(plot, rows=plots[key][0], cols=plots[key][1])
+
+	fig.update_yaxes(range=[0,300])
+	fig.update_layout(height=900, width=1300, title_text="Multiple Subplots with Titles")
+
+	fig.show()

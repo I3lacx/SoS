@@ -36,11 +36,16 @@ class Trainer:
 
 		# Set tf Variables
 		self.loss_log = []
-		self.seed_idx = tf.Variable(0, dtype=tf.int32)
+		# TODO only for debugging, maybe not the best spot here, not sure how though
+		self.grad_log = []
+		self.pool_log = []
+		self.x_log = []
+
+		self.seed_idx = tf.Variable(0, dtype=tf.int32, trainable=False)
 		self.seed_idx.assign(self.get_seed_idx())
 
 		# To set current number of ca steps
-		self.num_ca_steps = tf.Variable(0, dtype=tf.int32)
+		self.num_ca_steps = tf.Variable(0, dtype=tf.int32, trainable=False)
 
 		# Will be used if USE_PATTERN_POOL is true
 		self.batch = None
@@ -59,8 +64,10 @@ class Trainer:
 	def get_tf_optimizer(self):
 		# TODO change lr/optimizer
 		lr = cfg.TRAIN.LR
+		warmup_steps = cfg.TRAIN.WARM_UP * cfg.TRAIN.NUM_TRAIN_STEPS
+		# TODO dependent on warmup config
 		lr_sched = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
-			[30000, 70000], [lr, lr*0.1, lr*0.01])
+			[warmup_steps, 1000], [lr*0.1, lr, lr*0.1])
 		trainer = tf.keras.optimizers.Adam(lr)
 		return trainer
 
@@ -151,11 +158,22 @@ class Trainer:
 			# cuts and then put into the original pool
 			self.batch_idx = np.random.choice(len(self.pool_t), cfg.TRAIN.BATCH_SIZE, replace=False)
 			
-			x0 = np.copy(self.pool_t[self.batch_idx])
-			y0 = np.copy(self.y_train[0:cfg.TRAIN.BATCH_SIZE])
+			# Copy not needed! (Tested!)
+			x0 = self.pool_t[self.batch_idx]
+			y0 = self.y_train[0:cfg.TRAIN.BATCH_SIZE]
 
 			# Based on number of steps set amount to pure seeds
 			x0[0:self.seed_idx.numpy()] = self.x_train[0:self.seed_idx.numpy()]
+
+			if cfg.TRAIN.USE_Y_POOL:
+				# TODO choose which intervall size? -> with just //4 it could be too big...
+				# intervall_size = cfg.TRAIN.BATCH_SIZE - self.seed_idx.numpy()
+				intervall_size = cfg.TRAIN.BATCH_SIZE // 4
+
+				expanded_y = np.zeros_like(x0[0:intervall_size])
+				# Todo auslagern, use model to access these values
+				expanded_y[:,:,:,0:4] = self.y_train[0:intervall_size]
+				x0[-intervall_size:] = expanded_y
 
 			if cfg.TRAIN.MUTATE_POOL:
 				# 1/4th destroyed pictures
@@ -168,6 +186,8 @@ class Trainer:
 			# Initial most simple configuration -> Fill all of x0 with new x_train imgs.
 			x0 = self.x_train[0:cfg.TRAIN.BATCH_SIZE]
 			y0 = self.y_train[0:cfg.TRAIN.BATCH_SIZE]
+
+		# self.pool_log.append(np.amax(x0)**2)
 		return x0, y0
 
 
@@ -226,35 +246,45 @@ class Trainer:
 		# Get current x0, y0 dependent on the model configs/task
 		x0, y0 = self.get_new_x_y()
 
+		# TODO get rid of not needed np copys
 		# This is needde as x and y are tf.Variables, does not actually faster sadly
 		self.x.assign(x0)
 		self.y.assign(y0)
 
-		self.num_ca_steps.assign(np.random.randint(*cfg.WORLD.CA_STEP_RANGE))
 
-		x, losses = self.apply_grads(self.x, self.y)
+		self.num_ca_steps.assign(self.get_num_ca_steps())
+
+		x_out, losses, grads = self.apply_grads(self.x, self.y)
 		# x, loss = self.update_step(x, y0, seed_idx)
 
-		self.post_train_step(x, y0)
+		# self.x_log.append(np.amax(x.numpy())**2)
+		self.post_train_step(x_out, y0)
 
 		self.loss_log.append([x.numpy() for x in losses])
+		# [print(grad.numpy().flatten().shape) for grad in grads]
+		# max_grad = np.amax(np.hstack([grad.numpy().flatten() for grad in grads]))
+		# self.grad_log.append(max_grad)
 		# Not sure about returning here or saving locally
-		return x0, x, losses
+		return x0, x_out, losses, grads
 
 	@utils.timeit
-	def visualize(self, x0, x, loss, run_id=0):
+	def visualize(self, x0, x, loss, grads, run_id=0):
 		""" Check current step and visualize current results """
 		step_i = len(self.loss_log)
 
 		# Clearing display, to "update" the graph/msg
 		
-
 		# Viz loss and results
 		if step_i%50 == 0:
 			# TODO not working together, with plot as it keeps refreshing
 			# And I am unable to see anything
 			# disp.visualize_batch(self.ca, x0, x, step_i)
 			disp.clear()
+
+			disp.visualize_batch(self.ca, x0, x, step_i)
+			# disp.plot_loss(self.x_log, title="max(x)**2")
+			# disp.plot_loss(self.pool_log, title="max(Pool)**2")
+			# disp.plot_loss(self.grad_log)
 			disp.plot_losses(self.loss_log)
 			# pass
 
@@ -277,6 +307,24 @@ class Trainer:
 
 	def scatter_simple(self, title=utils.get_cfg_infos()):
 		disp.vis_scatter(self.vis, np.array(self.loss_log), title)
+
+	def get_num_ca_steps(self):
+		""" Get amount of ca steps to take this iteration based on warmup and cfg"""
+		# TODO randomize over batch? 
+
+		cur_step = len(self.loss_log)
+		warm_up_steps = cfg.TRAIN.WARM_UP * cfg.TRAIN.NUM_TRAIN_STEPS
+		# Check if passed the warmup stage:
+		if cur_step >= warm_up_steps:
+			return np.random.randint(*cfg.WORLD.CA_STEP_RANGE)
+		else:
+			cur_ratio = (cur_step * 0.95) / warm_up_steps + 0.05 
+			cur_step_range = [int(step * cur_ratio) for step in cfg.WORLD.CA_STEP_RANGE]
+			if cur_step_range[0] == cur_step_range[1]:
+				return cur_step_range[0]
+			else:
+				return np.random.randint(*cur_step_range)
+
 
 	def visdom_loss(self):
 		fig = disp.plot_loss(self.loss_log, return_plot=True)
@@ -375,7 +423,7 @@ class Trainer:
 			if cfg.TRAIN.LAYER_NORM:
 				grads = [g/(tf.norm(g)+1e-8) for g in grads]
 			self.optimizer.apply_gradients(zip(grads, self.ca.trainable_variables))
-			return x, losses
+			return x, losses, grads
 		return apply_grad
 
 
