@@ -123,6 +123,11 @@ def color_labels(x, y_pic, disable_black=False, dtype=tf.uint8):
 		return tf.cast(rgb, dtype) / 255.
 
 
+def ensure_dir(path):
+	if not os.path.exists(path):
+		os.makedirs(path)
+
+
 # Todo what is that? -> I think just making the picture bigger
 def zoom(img, scale=4):
 	img = np.repeat(img, scale, 0)
@@ -261,12 +266,9 @@ def read_json(filename):
 		data = json.load(f)
 	return data
 
-def save_cfg():
-	""" 
-	Saves all config objects in bytes and all changed information as jsons
-	At LOG_PATH + date + time
-	"""
 
+def get_full_log_path():
+	""" returns str for path to log directory of current session id"""
 	# First path for date
 	cur_path = cfg.EXTRA.LOG_PATH + cfg.EXTRA.SESSION_ID.split("/")[0] + "/"
 	if not os.path.isdir(cur_path):
@@ -274,8 +276,19 @@ def save_cfg():
 
 	# Ad second path for time
 	cur_path += cfg.EXTRA.SESSION_ID.split("/")[1] + "/"
-	os.mkdir(cur_path)
+	if not os.path.isdir(cur_path):
+		os.mkdir(cur_path)
 
+	return cur_path
+
+def save_cfg():
+	""" 
+	Saves all config objects in bytes and all changed information as jsons
+	At LOG_PATH + date + time
+	"""
+
+	cur_path = get_full_log_path()
+	
 	# Open and write into 'json' (not 100% json)
 	with open(cur_path + "diff.json", "w") as f:
 		for config_name in cfg.ALL_CONFIG_CLASSES:

@@ -26,7 +26,8 @@ class CAModel(tf.keras.Model):
 	""" Two modes, growing and classify, two completely seperate tasks """
 
 	def __init__(self, channel_n=cfg.MODEL.CHANNEL_N, fire_rate=cfg.WORLD.CELL_FIRE_RATE,
-							 add_noise=cfg.TRAIN.ADD_NOISE, env_size=cfg.WORLD.ENV_SIZE):
+							 add_noise=cfg.TRAIN.ADD_NOISE, env_size=cfg.WORLD.ENV_SIZE,
+							 summary_writer=None):
 		# CHANNEL_N does *not* include the greyscale channel.
 		# but it does include the 10 possible outputs.
 		super().__init__()
@@ -35,14 +36,33 @@ class CAModel(tf.keras.Model):
 		self.add_noise = add_noise
 		self.env_size = env_size
 
-		self.dmodel = self.get_dmodel()
+		self.summary_writer = summary_writer
 
-		# Input Layer this works, zeroes would also work
+		self.dmodel = self.get_dmodel()
+		self.weight_tensors = self._get_weight_tensors(cfg.EXTRA.LIST_OF_WEIGHT_NAMES)
+
+		self.initialize_model()
+
+
+	def initialize_model(self):
+
+		# Single call to build keras model and create graph
 		self(tf.keras.Input(shape=(cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)))
-		# self(tf.ones([1, 3, 3, channel_n + cfg.WORLD.ENV_SIZE]))
+		
+		if cfg.EXTRA.TB_GRAPH:
+			print("--- THIS FUNCTION CALLS FIT TO CREATE THE TB GRAPH ---")
+			print("RESET THE RUN TO ASSURE UNPAMPERED PERFORMANCE!")
+
+			x_in = np.zeros((1, cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N))
+			y_in = np.zeros((1, cfg.WORLD.SIZE, cfg.WORLD.SIZE, 16))
+			tb_callback = tf.keras.callbacks.TensorBoard(log_dir="graph_log/")
+			self.compile(optimizer='adam', loss='mse')
+			self.fit(x_in, y_in, batch_size=1, epochs=1, callbacks=tb_callback)
+
 
 	def get_dmodel(self):
-		""" returns dmodel based on cfg (number of layers and filter size)"""
+		""" returns dmodel based on cfg (number of layers and filter size)
+		cur_step used to log w value """
 		input_shape = (cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)
 		input_layer = tf.keras.Input(shape=input_shape)
 		
@@ -64,43 +84,148 @@ class CAModel(tf.keras.Model):
 			previous_layer = current_layer
 
 
+		if cfg.MODEL.BATCH_NORM:
+			current_layer = tf.keras.layers.BatchNormalization()(current_layer)
+
 		if cfg.MODEL.LAST_LAYER_INIT == "ZEROS":
-			final_layer = Conv2D(self.channel_n, 1, activation=None, kernel_initializer=tf.zeros_initializer)(previous_layer)
+			final_layer = Conv2D(self.channel_n, 1, activation=None, name="last_layer",
+								kernel_initializer=tf.zeros_initializer)(previous_layer)
+		elif cfg.MODEL.LAST_LAYER_INIT == "GLOROT":
+			final_layer = Conv2D(self.channel_n, 1, activation=None, name="last_layer",
+								kernel_initializer=tf.keras.initializers.GlorotNormal)(previous_layer)
+		elif cfg.MODEL.LAST_LAYER_INIT == "RANDOM_NORMAL":
+			final_layer = Conv2D(self.channel_n, 1, activation=None, name="last_layer",
+								kernel_initializer=tf.keras.initializers.RandomNormal(mean=0, stddev=0.025))(previous_layer)
 		else:
-			final_layer = Conv2D(self.channel_n, 1, activation=None)(previous_layer)
+			raise ValueError(f"Initializer {cfg.MODEL.LAST_LAYER_INIT}, not implemented")
 
-		if cfg.MODEL.UPDATE_GATE:
-			# Sigmoid because it has to be between 0 and 1
-			w = Conv2D(1, 1, activation="sigmoid", name="update_gate")(input_layer)
-			w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="w"))(w)
-			# TODO find more elegant solution:
-			# self.update_gate = w
+		if cfg.MODEL.GRU: 
+			# Full GRU implemenetation, will ignore cfg.MODEL.UPDATE_GATE
+			# input_layer -> h_t-1
+			# current_layer -> x_t
+			use_biases = cfg.MODEL.GRU_BIAS
 
-			# tf.print(w.numpy())
-			one = tf.ones_like(w, dtype=tf.float32)
-			l1 = tf.keras.layers.multiply([w, input_layer])
-			negated_w = tf.keras.layers.Add()([one, tf.math.negative(w)])
-			negated_w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="neg_w"))(negated_w)
-			# print(negated_w)
-			
-			# TODO not prefered option, this just changes the update, but otherwise val gets too high too quick!
-			final_layer = tf.keras.layers.multiply([negated_w, final_layer])
+			# TODO works?
+			# current_layer = final_layer
 
-			if cfg.MODEL.SET_WORLD_STATE:
-				# This will add l1 to final layer and thus is setting the world state
-				final_layer = tf.keras.layers.Add(name="Super_skip_layer")([l1, final_layer])
-			# final_layer = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="final_layer"))(final_layer)
+			if cfg.MODEL.LAST_LAYER_INIT == "ZEROS":
+				initializer = kernel_initializer=tf.zeros_initializer
+			elif cfg.MODEL.LAST_LAYER_INIT == "GLOROT":
+				initializer = kernel_initializer=tf.keras.initializers.GlorotNormal
+			else:
+				raise ValueError(f"Initializer {cfg.MODEL.LAST_LAYER_INIT}, not implemented")
 
-		model = tf.keras.models.Model(name="dmodel", inputs=input_layer, outputs=final_layer)
+			with tf.name_scope("Update_Gate") as scope:
+				H_z = Conv2D(1, 1, activation=None, name="update_h", use_bias=use_biases, kernel_initializer=initializer)(input_layer)
+				W_z = Conv2D(1, 1, activation=None, name="update_x", use_bias=use_biases, kernel_initializer=initializer)(current_layer)
+				update_gate = tf.keras.activations.sigmoid(H_z + W_z)
 
+			# update_gate = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="u_g"))(update_gate)
+
+			with tf.name_scope("Reset_Gate") as scope:
+				H_r = Conv2D(1, 1, activation=None, name="reset_h", use_bias=use_biases, kernel_initializer=initializer)(input_layer)
+				W_r = Conv2D(1, 1, activation=None, name="reset_x", use_bias=use_biases, kernel_initializer=initializer)(current_layer)
+				reset_gate = tf.keras.activations.sigmoid(H_r + W_r)
+
+			with tf.name_scope("H_prime") as scope:
+				H_h = Conv2D(1, 1, activation=None, name="h_prime_h", use_bias=use_biases, kernel_initializer=initializer)(input_layer * reset_gate)
+				W_h = Conv2D(1, 1, activation=None, name="h_prime_x", use_bias=use_biases, kernel_initializer=initializer)(current_layer) 
+				h_t_prime = tf.keras.activations.tanh(H_h + W_h)
+
+			# h_t_prime = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="h_t_prime"))(h_t_prime)
+			final_layer = update_gate * input_layer + (1 - update_gate) * h_t_prime
+
+		else: 
+			if cfg.MODEL.UPDATE_GATE:
+				# Sigmoid because it has to be between 0 and 1
+				w = Conv2D(1, 1, activation="sigmoid", name="update_gate")(input_layer)
+				w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="w"))(w)
+				
+				# self.w = w
+				# Will/Should get step automatically
+				# with self.summary_writer.as_default():
+					# tf.summary.histogram("update_gate", w, step=tf.summary.experimental.set_step)
+				# TODO find more elegant solution:
+				# self.update_gate_log.append(w.numpy())
+
+				# tf.print(w.numpy())
+				one = tf.ones_like(w, dtype=tf.float32)
+				l1 = tf.keras.layers.multiply([w, input_layer])
+				negated_w = tf.keras.layers.Add()([one, tf.math.negative(w)])
+				# negated_w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="neg_w"))(negated_w)
+				# print(negated_w)
+				
+				# TODO not prefered option, this just changes the update, but otherwise val gets too high too quick!
+				final_layer = tf.keras.layers.multiply([negated_w, final_layer])
+
+				if cfg.MODEL.SET_WORLD_STATE:
+					# This will add l1 to final layer and thus is setting the world state
+					final_layer = tf.keras.layers.Add(name="Super_skip_layer")([l1, final_layer])
+				# final_layer = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="final_layer"))(final_layer)
+
+		# TODO this is the most ugliest thing I have ever seen
+		model = tf.keras.models.Model(name="dmodel", inputs=input_layer, outputs=[final_layer, current_layer])
+		# print(f"-\n\n {model.output} \n\n")
 		return model
 
+	def _get_name_list_of_model(self):
+		""" returns a by index ordered list of tensors of the model """
+		return [tensor.name for tensor in self.weights]
+
+	# TODO this is so very hacky, this should not be how its implemented...
+	def _get_weight_tensors(self, name_list):
+		""" useses str list for names and searches through model to return
+		tensors with those names in the same order """
+		name_list_model = self._get_name_list_of_model()
+		weight_tensors = []
+
+		# special case in configs to get all 
+		if name_list == "all":
+			return self.weights
+
+		for name in name_list:
+			try: 
+				idx = name_list_model.index(name)
+				weight_tensors.append(self.weights[idx])
+			except ValueError as e:
+				print(f"Name: {name}, not found inside name_list: ", e)
+		return weight_tensors
+
+	def _tb_log_list_of_tensor(self, tensor_list, current_step):
+		""" logs weights to tensorboard from a list, given the current_step """
+		for tensor in tensor_list:
+			self._tb_log_weight(tensor, current_step)
+
+	def _tb_log_weight(self, tensor, current_step):
+		""" pre defined operations and name scopes to log a weight variable """
+		# TODO add more diverse summaries, add etc. max, min, mean and stuff
+		# TODO add print if operation has failed
+		# TODO maybe writer outside the loop if possible
+		with self.summary_writer.as_default():
+			# print(tensor.name, tensor.weight)
+			tf.summary.histogram(tensor.name, tensor.numpy(), current_step)
+
+	def tb_log_weights(self, current_step):
+		""" function to call to log weights specified (TODO in the configs?)
+		with the same function, These tensors stay the same during one execution """
+
+		if cfg.EXTRA.TENSORBOARD:
+			self._tb_log_list_of_tensor(self.weight_tensors, current_step)
+
 	# TODO this does't even make a difference, so just remove it?
-	# @tf.function
+	@tf.function
 	def call(self, x, fire_rate=None, manual_noise=None):
 		env, state = tf.split(x, [self.env_size, self.channel_n], -1)
 
-		ds = self.dmodel(x)
+		ds, cnn_out = self.dmodel(x)
+
+		# print(self.w)
+		# print(type(self.dmodel))
+		# TODO only if self.w is a thing
+		# with self.summary_writer.as_default():
+			# TODO add current step
+			# w = tf.get_default_graph().get_tensor_by_name("update_gate")
+		# tf.summary.histogram("update_gate", self.w, cur_step)
 
 		# if cfg.MODEL.KEEP_OLD_STATE:
 			# dmodel is its first and only layer...
@@ -141,7 +266,7 @@ class CAModel(tf.keras.Model):
 		residual_mask = update_mask & living_mask
 
 		# Directly assign the world state instead of updating it
-		if cfg.MODEL.SET_WORLD_STATE:
+		if cfg.MODEL.SET_WORLD_STATE or cfg.MODEL.GRU:
 			# In order to apply the mask, only the active channels will be updated
 			# TODO this is a np operation, which should be converted to a tf operation, but not tested!
 			# This will update all values in state where mask is True and set values to ds
@@ -152,7 +277,7 @@ class CAModel(tf.keras.Model):
 			ds *= tf.cast(residual_mask, tf.float32)
 			state += ds
 
-		return tf.concat([env, state], -1)
+		return tf.concat([env, state], -1), cnn_out
 
 	# @tf.function
 	def initialize(self, images):
@@ -163,8 +288,15 @@ class CAModel(tf.keras.Model):
 
 
 	def print_layer(self, x, text):
-		# TODO config to enable/disable print
+		# TODO config to enable/disable saving?
+
+		# self.w_log.append(tf.math.reduce_mean(x))
+		
+		# self.w_log = self.w_log.write(cur_step, tf.math.reduce_mean(x))
+		# self.w_log.append(tf.math.reduce_mean(x))
+
 		if cfg.EXTRA.PRINT_LAYER:
+			# pass
 			tf.print(text, x.shape, tf.math.reduce_min(x), tf.math.reduce_mean(x), tf.math.reduce_max(x))
 		# tf.print(tf.math.reduce_max(x))
 		return x

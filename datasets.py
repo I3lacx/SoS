@@ -150,6 +150,8 @@ class Emoji:
 			return "203c"
 		elif emoji_str == "heavy_check_mark":
 			return "2714"
+		elif emoji_str == "heart":
+			return "2764"
 		else:
 			raise ValueError(f"string: {emoji_str} not implemented")
 

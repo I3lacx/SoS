@@ -50,15 +50,16 @@ class VideoWriter:
 		self.close()
 
 
-def show_simple_run(x0, ca, num_steps=20, batch=0, only_alive_cells=False):
+def show_simple_run(x0, ca, num_steps=20, batch=0, only_alive_cells=False, white_background=False):
 	x = x0
 	with VideoWriter("_autoplay.mp4") as vid:
 		for i in range(num_steps):
 			x = ca(x)
 			if only_alive_cells:
-				vid.add(utils.zoom((x[batch, :, :, 3].numpy() > 0.1).astype(np.float32)))
+				res = utils.zoom((x[batch, :, :, 3].numpy() > 0.1).astype(np.float32))
+				vid.add(res)
 			else:
-				vid.add(utils.zoom(rgba_to_rgb(ca.classify(x)[batch])))
+				vid.add(utils.zoom(rgba_to_rgb(ca.classify(x)[batch], white_background=white_background)))
 	run = Video("./_autoplay.mp4", width=320, height=220, html_attributes="autoplay controls", embed=True)
 	return run
 
@@ -149,7 +150,8 @@ def plot_session(sess_id):
 
 import textwrap
 
-def plot_losses(loss_logs, log_scale=False, return_plot=False, plot_mean=True, smoothing_weight=0.8, title_text=utils.get_cfg_infos()):
+def plot_losses(loss_logs, log_scale=False, return_plot=False, plot_mean=True,
+ smoothing_weight=0.8, title_text=utils.get_cfg_infos(), textwrap_width=120):
 	""" loss logs to plot in a single graph. 
 	Expected shape: [n, number_losses] """
 	
@@ -163,7 +165,7 @@ def plot_losses(loss_logs, log_scale=False, return_plot=False, plot_mean=True, s
 		fig.add_trace(trace)
 		fig.add_trace(smooth)
 
-	fig.layout.title.text = "<br>".join(textwrap.wrap(title_text, width=120))
+	fig.layout.title.text = "<br>".join(textwrap.wrap(title_text, width=textwrap_width))
 	fig.layout.title.font.size = 12
 	# fig.layout.uniformtext.mode = "show"
 
@@ -207,12 +209,15 @@ def imshow(a, fmt='jpeg'):
 	# plt.show()
 
 
-def rgba_to_rgb(rgba_img):
+def rgba_to_rgb(rgba_img, white_background=False):
 	''' Inverts alpha channel to add to rgb on white '''
-	rgb, a = rgba_img[...,:3], rgba_img[...,3:4]
-	rgb = rgba_img[...,:3] * rgba_img[...,3:4]
-	# return 1.0-a+rgb
-	return rgb
+	rgb = np.clip(rgba_img[...,:3], 0.0, 1.0)
+	a = np.clip(rgba_img[...,3:4], 0.0, 1.0)
+
+	if white_background:
+		return 1.0 - a + rgb
+	else:
+		return rgba_img[...,:3] * rgba_img[...,3:4]
 
 
 def visualize_batch(ca, x0, x, step_i):

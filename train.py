@@ -61,6 +61,17 @@ class Trainer:
 		# print("pool size ", self.pool_t.shape)
 
 
+	def save_weights(self, path="", name="model"):
+		if path == "":
+			path = utils.get_full_log_path()
+
+		utils.ensure_dir(path)
+
+		self.ca.save_weights(path + name)
+
+	def load_weights(self, path):
+		self.ca.load_weights(path)
+
 	def get_tf_optimizer(self):
 		# TODO change lr/optimizer
 		lr = cfg.TRAIN.LR
@@ -240,7 +251,7 @@ class Trainer:
 		return x0, y0
 
 	@utils.timeit
-	def full_train_step(self):
+	def full_train_step(self, current_step):
 		""" Run a full training step -> new_imgs, run/update ca """
 
 		# Get current x0, y0 dependent on the model configs/task
@@ -254,18 +265,18 @@ class Trainer:
 
 		self.num_ca_steps.assign(self.get_num_ca_steps())
 
-		x_out, losses, grads = self.apply_grads(self.x, self.y)
+		x_out, losses, grads, log = self.apply_grads(self.x, self.y)
 		# x, loss = self.update_step(x, y0, seed_idx)
 
 		# self.x_log.append(np.amax(x.numpy())**2)
-		self.post_train_step(x_out, y0)
+		self.post_train_step(x_out, y0, current_step)
 
 		self.loss_log.append([x.numpy() for x in losses])
 		# [print(grad.numpy().flatten().shape) for grad in grads]
 		# max_grad = np.amax(np.hstack([grad.numpy().flatten() for grad in grads]))
 		# self.grad_log.append(max_grad)
 		# Not sure about returning here or saving locally
-		return x0, x_out, losses, grads
+		return x0, x_out, losses, grads, log
 
 	@utils.timeit
 	def visualize(self, x0, x, loss, grads, run_id=0):
@@ -357,7 +368,7 @@ class Trainer:
 
 		return int(np.around(cfg.TRAIN.BATCH_SIZE * seed_ratio))
 
-	def post_train_step(self, x, y0):
+	def post_train_step(self, x, y0, current_step):
 		# TODO more complicated for mnist
 
 		# Update seed ratio
@@ -367,6 +378,10 @@ class Trainer:
 		if cfg.TRAIN.POOL_TANH:
 			x = tf.math.tanh(x)
 		self.pool_t[self.batch_idx] = x.numpy()
+
+		# Save update to tensorboard
+		self.ca.tb_log_weights(current_step)
+
 
 		# if cfg.USE_PATTERN_POOL:
 		# 			self.pool.update()
@@ -408,11 +423,42 @@ class Trainer:
 		@tf.function
 		def apply_grad(x, y):
 
+			
+			log = {
+			"cnn":{
+				"max":[],
+				"min":[],
+				"mean":[]},
+			"in":{
+				"max":[],
+				"min":[],
+				"mean":[]},
+			"out":{
+				"max":[],
+				"min":[],
+				"mean":[]}
+			}
+
 			with tf.GradientTape() as g:
 				# TODO tf range is actually slower than writing it out...
 				for i in tf.range(self.num_ca_steps):
-					x = self.ca(x)
+					if cfg.EXTRA.LOG_LAYERS:
+						log["in"]["max"].append(np.amax(x.numpy()))
+						log["in"]["min"].append(np.amin(x.numpy()))
+						log["in"]["mean"].append(np.mean(x.numpy()))
 
+					out = self.ca(x)
+					x, cnn_l = out[0], out[1]
+
+					if cfg.EXTRA.LOG_LAYERS:
+						log["out"]["max"].append(np.amax(x.numpy()))
+						log["out"]["min"].append(np.amin(x.numpy()))
+						log["out"]["mean"].append(np.mean(x.numpy()))
+
+						log["cnn"]["max"].append(np.amax(cnn_l.numpy()))
+						log["cnn"]["min"].append(np.amin(cnn_l.numpy()))
+						log["cnn"]["mean"].append(np.mean(cnn_l.numpy()))
+					
 				# TODO is there a better way?
 				losses = self.get_losses(x, y)
 
@@ -420,10 +466,17 @@ class Trainer:
 
 			# LAYER_NORM will normalize over a single layer + batch, similar effect
 			# As weigth normalization after applying the update
+			# TODO if Update gate is true, only a single value will be normed to {-1,1}
 			if cfg.TRAIN.LAYER_NORM:
-				grads = [g/(tf.norm(g)+1e-8) for g in grads]
+				normed_grads = []
+				for layer_grad in grads:
+					normed_grads.append(layer_grad / (tf.norm(layer_grad) + 1e-8))
+
+				grads = normed_grads
+				# Old implementation
+				# grads = [g/(tf.norm(g)+1e-8) for g in grads]
 			self.optimizer.apply_gradients(zip(grads, self.ca.trainable_variables))
-			return x, losses, grads
+			return x, losses, grads, log
 		return apply_grad
 
 
