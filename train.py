@@ -11,6 +11,7 @@ import models
 
 import tensorflow as tf
 import numpy as np
+import os
 
 
 class Trainer:
@@ -20,26 +21,29 @@ class Trainer:
 	Could be set in here, but so far in config file.
 	"""
 
-	def __init__(self, x_train, y_train, ca, vis):
-		self.x_train = x_train
-		self.y_train = y_train
-		self.ca = ca
-
-		# Visdom for visualization
-		self.vis = vis
+	def __init__(self, train_set, val_set, ca, vis, seperator):
+		self.train_set = train_set
+		self.val_set = val_set
+		self.ca = ca 		# cellular automata (model) for computation
+		self.vis = vis 		# visdom for visualization
+		self.seperator = seperator
 
 		# mostly to set the shape, values will be overwirtten anyways
 		# TODO Variable does not really help, just makes it more complicated
-		self.x = tf.Variable(self.x_train[0:cfg.TRAIN.BATCH_SIZE], trainable=False)
-		self.y = tf.Variable(self.y_train[0:cfg.TRAIN.BATCH_SIZE], trainable=False)
+		self.x = tf.Variable(self.train_set["x"][0:cfg.TRAIN.BATCH_SIZE], trainable=False)
+		self.y = tf.Variable(self.train_set["y"][0:cfg.TRAIN.BATCH_SIZE], trainable=False)
 		# How much initial seeds used inside the pool, decreases after steps
 
 		# Set tf Variables
 		self.loss_log = []
+		self.val_loss_log = {}
 		# TODO only for debugging, maybe not the best spot here, not sure how though
 		self.grad_log = []
 		self.pool_log = []
 		self.x_log = []
+
+		# saving old x values for cfg.train.keep_output
+		self.x_old, self.y_old, self.old_idx_array = self.get_train_batch(first_call=True)
 
 		self.seed_idx = tf.Variable(0, dtype=tf.int32, trainable=False)
 		self.seed_idx.assign(self.get_seed_idx())
@@ -51,14 +55,11 @@ class Trainer:
 		self.batch = None
 
 		self.optimizer = self.get_tf_optimizer()
-		self.pool = self.get_pool()
-
-		# Get function to apply gradients
+		
+		# Get function to apply gradient
 		self.apply_grads = self.get_apply_grad_fn()
 
-		# TODO remove for testing only
-		self.pool_t = np.repeat(self.x_train[0:1], cfg.TRAIN.POOL_SIZE, 0)
-		# print("pool size ", self.pool_t.shape)
+		self.regularizer = tf.keras.regularizers.L2(0.1)
 
 
 	def save_weights(self, path="", name="model"):
@@ -67,7 +68,10 @@ class Trainer:
 
 		utils.ensure_dir(path)
 
-		self.ca.save_weights(path + name)
+		if not os.path.exists(path + name + ".index"):
+			self.ca.save_weights(path + name)
+		else:
+			raise ValueError(f"Failed to save because path: {path+name} already exists")
 
 	def load_weights(self, path):
 		self.ca.load_weights(path)
@@ -83,95 +87,86 @@ class Trainer:
 		return trainer
 
 	def get_pool(self):
-		if cfg.WORLD.TASK["TASK"] == "growing":
-			# Use x,y directly as sample pool (always the same)
-			# x and y train are created for pool size
-			pool = datasets.SamplePool(x=self.x_train, y=self.y_train)
-		elif cfg.WORLD.TASK["TASK"] == "classify":
-			starting_indexes = np.random.randint(0, self.x_train.shape[0]-1, size=cfg.TRAIN.POOL_SIZE)
-			# pool is a Class defined in datasets
-			pool = datasets.SamplePool(x=self.ca.initialize(self.x_train[starting_indexes]).numpy(),
-						 y=self.y_train[starting_indexes])
-		else:
-			raise ValueError()
-
+		raise ImplementationError("Deprecated!")
+		# TODO this is wrong! It should use the dataset by now, not the pool!
+		# Only x pool, as y is alwalys the same
+		# TODO pool is completely shit!
+		pool = np.repeat(self.x_train, cfg.TRAIN.POOL_SIZE // np.shape(self.x_train)[0] , 0)
 		return pool
 
 	def get_random_train_idx(self, size):
 		return np.random.randint(0, self.x_train.shape[0]-1, size=size)
 
 	@utils.timeit
-	def get_new_x_y(self):
-		if cfg.WORLD.TASK["TASK"] == "classify":
-			return self.get_new_mnist_x_y()
-		elif cfg.WORLD.TASK["TASK"] == "growing":
-			return self.get_new_emoji_x_y()
-		else:
-			raise ValueError(f"Task {cfg.WORLD.TASK['TASK']}, not implemented")
+	def get_train_batch(self, first_call=False):
+		if first_call:
+			# Get random batch for first call
+			rand_batch_idx = np.random.choice(cfg.DATA.TRAIN_SIZE, cfg.TRAIN.BATCH_SIZE, replace=False)
+			x0 = np.copy(self.train_set["x"][rand_batch_idx])
+			y0 = np.copy(self.train_set["y"][rand_batch_idx])
+			idx_array = self.get_idx_array(None, rand_batch_idx, first_call=True)
+			return x0, y0, idx_array
+
+		# Randomly decide which inputs will be reused, which not
+		# if idx_mask is true, value will be kept for next train step
+		idx_mask = np.random.choice([True, False], size=cfg.TRAIN.BATCH_SIZE, 
+					p=[cfg.TRAIN.KEEP_OUTPUT, 1 - cfg.TRAIN.KEEP_OUTPUT])
+		not_idx_mask = np.logical_not(idx_mask)
+
+		# replace values to be replaced with new x_train_img
+		num_replaced_images = sum(not_idx_mask)
+		rand_batch_idx = np.random.choice(cfg.DATA.TRAIN_SIZE, num_replaced_images, replace=False)
+
+		idx_array = self.get_idx_array(idx_mask, rand_batch_idx)
+
+		x0 = self.x_old
+		y0 = self.y_old
+		self.old_idx_array = idx_array
+
+		x0[not_idx_mask] = np.copy(self.train_set["x"][rand_batch_idx])
+		y0[not_idx_mask] = np.copy(self.train_set["y"][rand_batch_idx])
+
+		# Todo what to do with idx_array?
+		# should not be needed for pure training?
+		return x0, y0
+
+	def get_idx_array(self, idx_mask, rand_batch_idx, first_call=False):
+		""" 
+		Get Array with ids of current selected emojis and which was used from a previous iteration
+		Idx 1->N for which emoji was used, based on dataset seperator, negative for used 
+		in previous iteration
+		"""
+		return None
+		if first_call:
+			print(self.seperator)
+		# print("TODO, use the seperator")
+		return None
 
 
 	def cut_x(self, x):
+		raise ImplementationError("Moved to dataset")
+		# TODO should be moved to dataset
 		""" Removing a random sized box from x and setting it to 0 
 				Works with single images and batch_sized images """
-		
-		if len(x.shape) == 3:
-			# Expand first dim
-			x = x[None,:]
-		
-		# Copy, to make sure not to destroy x
-		x = np.copy(x)
-		
-		# Define ranges and pick random box size
-		box_size_range_x = [x.shape[-3]*0.2, x.shape[-3]*0.8]
-		box_size_range_y = [x.shape[-2]*0.2, x.shape[-2]*0.8]
-		box_width = np.random.randint(*box_size_range_x, size=x.shape[0])
-		box_height = np.random.randint(*box_size_range_y, size=x.shape[0])
-		
-		# Randomly select the middle coordinates of the box
-		box_x_mid = np.random.randint(x.shape[-3]*0.2, x.shape[-3]*0.8, size=x.shape[0])
-		box_y_mid = np.random.randint(x.shape[-2]*0.2, x.shape[-2]*0.8, size=x.shape[0])
-		
-		# Get the upper left corner of the box and check boundaries
-		x1 = box_x_mid - (box_width/2).astype(int)
-		y1 = box_y_mid - (box_height/2).astype(int)
-		x1 = np.amax([np.zeros(x.shape[0]), x1], axis=0)
-		y1 = np.amax([np.zeros(x.shape[0]), y1], axis=0)
-		
-		# Get lower right corner of the box and check boundaries
-		bound_x = x.shape[-3] * np.ones(x.shape[0])
-		bound_y = x.shape[-2] * np.ones(x.shape[0])
-		x2 = np.amin([bound_x, x1 + box_width], axis=0)
-		y2 = np.amin([bound_y, y1 + box_height], axis=0)
-		
-		# Create Mask to broadcast into batch size
-		r1 = np.arange(x.shape[-3])
-		r2 = np.arange(x.shape[-2])
-
-		# Broadcasting magic
-		mask_x = np.repeat(((x1[:,None] <= r1) & (x2[:,None] >= r1))[:,:,None], x.shape[2], 2)
-		mask_y = np.repeat(((y1[:,None] <= r2) & (y2[:,None] >= r2))[:,None,:], x.shape[1], 1)
-		mask = mask_x & mask_y
-
-		# Apply mask
-		x[mask] = 0.
-		return x
 
 	def get_new_emoji_x_y(self):
 		""" 
+		DEPRECATED, SHOULD BE REPLACED!
 		Get new x and y. For simple config, always init seed and same y 
 		Here our x_train is just the single initial seed, y_train is just the
 		single emoji goal
 		"""
+		raise ImplementationError("Old")
 		# TODO new minst/emoji likely can be fully merged
-		if cfg.TRAIN.USE_PATTERN_POOL:
+		if cfg.TRAIN.USE_PATTERN_POOL and not cfg.TRAIN.KEEP_OUTPUT:
 
 			# TODO currently these idx will be replaced with inits from init seed/
 			# cuts and then put into the original pool
-			self.batch_idx = np.random.choice(len(self.pool_t), cfg.TRAIN.BATCH_SIZE, replace=False)
+			self.batch_idx = np.random.choice(len(self.pool), cfg.TRAIN.BATCH_SIZE, replace=False)
 			
 			# Copy not needed! (Tested!)
-			x0 = self.pool_t[self.batch_idx]
-			y0 = self.y_train[0:cfg.TRAIN.BATCH_SIZE]
+			x0 = self.pool[self.batch_idx]
+			y0 = self.y_train[self.batch_idx]
 
 			# Based on number of steps set amount to pure seeds
 			x0[0:self.seed_idx.numpy()] = self.x_train[0:self.seed_idx.numpy()]
@@ -193,6 +188,27 @@ class Trainer:
 				# Randomly removes part of the image for the last 1/4th elements
 				x0[-q_bs:] = self.cut_x(x0[-q_bs:])
 			# No else path needed as pool values already assigned
+		elif cfg.TRAIN.KEEP_OUTPUT:
+			# has all the idx to keep, thus reverse it to throw the others out
+			idx_mask = np.random.choice([True, False], size=cfg.TRAIN.BATCH_SIZE, 
+						p=[cfg.TRAIN.KEEP_OUTPUT, 1 - cfg.TRAIN.KEEP_OUTPUT])
+			not_idx_mask = np.logical_not(idx_mask)
+
+			try:
+				x0 = self.x_old.numpy()
+				y0 = self.y_old.numpy()
+			except AttributeError:
+				# TODO this seems to be a hot fix, somewhere in dataset it should be made an array
+				x0 = self.x_old
+				y0 = self.y_old
+
+			# replace values to be replaced with new x_train_img
+			num_replaced_images = sum(not_idx_mask)
+			rand_batch_idx = np.random.choice(cfg.TRAIN.POOL_SIZE, num_replaced_images, replace=False)
+
+			x0[not_idx_mask] = np.copy(self.x_train[rand_batch_idx])
+			y0[not_idx_mask] = np.copy(self.y_train[rand_batch_idx])
+
 		else:
 			# Initial most simple configuration -> Fill all of x0 with new x_train imgs.
 			x0 = self.x_train[0:cfg.TRAIN.BATCH_SIZE]
@@ -201,67 +217,17 @@ class Trainer:
 		# self.pool_log.append(np.amax(x0)**2)
 		return x0, y0
 
-
-	def get_new_mnist_x_y(self):
-		# Pattern Pool depends on the Model type (starting with very simple (False, False) Model) 
-		if cfg.TRAIN.USE_PATTERN_POOL:
-			# Use the same pool for training, but replace 1/2 of the images with random images
-			# from the training set. First Fourth normal random, last fourth maybe mutated in a weird
-			# way.
-			self.batch = self.pool.sample(cfg.TRAIN.BATCH_SIZE)
-			x0 = np.copy(self.batch.x)
-			y0 = self.batch.y
-
-			# we want half of them new. We remove 1/4 from the top and 1/4 from the
-			# bottom.
-			q_bs = cfg.TRAIN.BATCH_SIZE // 4
-
-			# Initialize the first q_bs images with random x images
-			new_idx = self.get_random_train_idx(size=q_bs)
-			x0[:q_bs] = self.ca.initialize(self.x_train[new_idx])
-			y0[:q_bs] = self.y_train[new_idx]
-
-			# Again, but x not initialized
-			new_idx = self.get_random_train_idx(size=q_bs)
-			new_x, new_y = self.x_train[new_idx], self.y_train[new_idx]
-
-			if cfg.TRAIN.MUTATE_POOL:
-				# Mask with x to 0/1 via booleans 1 if > 0.1
-				new_x = tf.reshape(new_x, [q_bs, 28, 28, 1])
-				mutate_mask = tf.cast(new_x > 0.1, tf.float32)
-
-				# Mutating x by using a random other images as a mask to throw away some
-				# of the hidden states. But only where the number is 0, the other number...
-				# TODO look closer into this! And show Images to make sure this is what happens...
-				# They mutated -> new image mask is the new image Switching out the numbers
-				# Also iln first iteration all will be 0s anyways
-				mutated_x = tf.concat([new_x, x0[-q_bs:,:,:,1:] * mutate_mask], -1)
-
-				# - does the last 1/4th elements
-				x0[-q_bs:] = mutated_x
-				y0[-q_bs:] = new_y
-			else:
-				x0[-q_bs:] = self.ca.initialize(new_x)
-				y0[-q_bs:] = new_y
-		else:
-			# Initial most simple configuration -> Fill all of x0 with new x_train imgs.
-			b_idx = self.get_random_train_idx(size=cfg.TRAIN.BATCH_SIZE)
-			x0 = self.ca.initialize(self.x_train[b_idx])
-			y0 = self.y_train[b_idx]
-		return x0, y0
-
 	@utils.timeit
 	def full_train_step(self, current_step):
 		""" Run a full training step -> new_imgs, run/update ca """
 
 		# Get current x0, y0 dependent on the model configs/task
-		x0, y0 = self.get_new_x_y()
+		x0, y0 = self.get_train_batch()
 
 		# TODO get rid of not needed np copys
 		# This is needde as x and y are tf.Variables, does not actually faster sadly
 		self.x.assign(x0)
 		self.y.assign(y0)
-
 
 		self.num_ca_steps.assign(self.get_num_ca_steps())
 
@@ -278,9 +244,36 @@ class Trainer:
 		# Not sure about returning here or saving locally
 		return x0, x_out, losses, grads, log
 
+	def get_val_loss(self):
+		
+		# iterate over the whole validation set, then get average
+		# loss after 50,100,150 steps?
+		# or mean of range *1, *2, ...
+
+		losses = {}
+		# starting with the average of all of the
+		for emoji_name, emoji_dict in self.seperator["val"].items():
+			for key, value in emoji_dict.items():
+				cur_x = self.val_set["x"][value[0]:value[1]]
+				cur_y = self.val_set["y"][value[0]:value[1]]
+
+				num_steps = int(np.mean(cfg.WORLD.CA_STEP_RANGE))
+				# TODO maybe also loss after 1/2/3 times this range
+				x = cur_x
+				for i in range(num_steps):
+					x = self.ca(x)
+
+				cur_loss = self.batch_l2_loss(x, cur_y)
+				# The loss is an array so that later I can append those values!
+				losses[emoji_name+ "_" + key] = [cur_loss.numpy()]
+
+		return losses
+
+
 	@utils.timeit
-	def visualize(self, x0, x, loss, grads, run_id=0):
+	def visualize(self, x0, x, losses, grads, run_id=0):
 		""" Check current step and visualize current results """
+		# TODO losses does not need to be used as all information should be in loss_log
 		step_i = len(self.loss_log)
 
 		# Clearing display, to "update" the graph/msg
@@ -292,11 +285,14 @@ class Trainer:
 			# disp.visualize_batch(self.ca, x0, x, step_i)
 			disp.clear()
 
-			disp.visualize_batch(self.ca, x0, x, step_i)
+			disp.visualize_batch(self.ca, x0, x, step_i, white_background=False)
 			# disp.plot_loss(self.x_log, title="max(x)**2")
 			# disp.plot_loss(self.pool_log, title="max(Pool)**2")
 			# disp.plot_loss(self.grad_log)
-			disp.plot_losses(self.loss_log)
+
+			# print(self.val_loss_log)
+			disp.plot_train_and_val_loss(self.loss_log, self.val_loss_log, y_range=(0,400))
+			# disp.plot_losses(self.loss_log, y_range=(0,400))
 			# pass
 
 		# Viz current pool
@@ -304,13 +300,10 @@ class Trainer:
 			pass
 			# TODO
 			# utils.generate_pool_figures(self.ca, self.pool, step_i)
-		
-		# Save model
-		if step_i%10000 == 0:
-			self.save_model()
 
 		# Simple print to show progress, will be overwritten in each step
-		print('\r r: %d step: %d, full_loss: %.3f'%(run_id, step_i, loss[0]), end='')
+		print('\r r: %d step: %d, total_loss: %.3f min: %.3f max: %.3f'%(run_id,
+		 step_i, losses[0], np.amin(self.loss_log), np.amax(self.loss_log)), end='')
 		
 		# 
 		# disp.show(str('step: %d, log10(loss): %.3f'%(step_i, np.log10(loss))))
@@ -368,6 +361,18 @@ class Trainer:
 
 		return int(np.around(cfg.TRAIN.BATCH_SIZE * seed_ratio))
 
+	def update_val_loss(self, current_step):
+		# TODO bit hacky because current step starts at 1...
+		if (current_step-1) % cfg.EXTRA.VAL_LOG_INTERVALL == 0:
+			val_loss_dict = self.get_val_loss()
+
+			if self.val_loss_log == {}:
+				self.val_loss_log = val_loss_dict
+			else:
+				# Append new values to dict
+				for key, value in val_loss_dict.items():
+					self.val_loss_log[key] += value
+
 	def post_train_step(self, x, y0, current_step):
 		# TODO more complicated for mnist
 
@@ -377,7 +382,15 @@ class Trainer:
 		# Force pool values to be inside range (-1,1)
 		if cfg.TRAIN.POOL_TANH:
 			x = tf.math.tanh(x)
-		self.pool_t[self.batch_idx] = x.numpy()
+
+		if cfg.TRAIN.KEEP_OUTPUT: 
+			# save old x value
+			self.x_old = np.array(x)
+			self.y_old = y0
+		elif cfg.TRAIN.USE_PATTERN_POOL:
+			self.pool[self.batch_idx] = x.numpy()
+
+		self.update_val_loss(current_step)
 
 		# Save update to tensorboard
 		self.ca.tb_log_weights(current_step)
@@ -392,8 +405,14 @@ class Trainer:
 	# @tf.function
 	def individual_l2_loss(self, x, y):
 		""" Creates loss, fitting to task """
+		
 		t = y - self.ca.classify(x)
-		return tf.reduce_sum(t**2, [1, 2, 3]) / 2
+
+		if cfg.TRAIN.REGULARIZER:
+			reg = self.regularizer(x[:,:,:,4:])
+			return tf.reduce_sum(t**2, [1, 2, 3]) / 2 + reg
+		else:
+			return tf.reduce_sum(t**2, [1, 2, 3]) / 2
 
 	# @tf.function
 	def batch_l2_loss(self, x, y):
@@ -404,13 +423,25 @@ class Trainer:
 		""" Returns configured loss for model, if grad is true only the total loss 
 			loss at [0] is always the total loss used for gradients """
 		
+
+		full_loss = self.batch_l2_loss(x,y)
+		# returs array, so its easier to add different losses to this equation
+		return [full_loss]
+
+		# Deprecated functionallity
 		loss = []
 		if cfg.TRAIN.LOSS_TYPE == "l2":
 			seed_loss = self.batch_l2_loss(x[:self.seed_idx], y[:self.seed_idx])
 			if self.seed_idx < cfg.TRAIN.BATCH_SIZE:
 				pool_loss = self.batch_l2_loss(x[self.seed_idx:], y[self.seed_idx:])
 			else:
-				pool_loss = float('NaN')
+				if cfg.MODEL.FLOATX == "float32":
+					pool_loss = np.float32('NaN')
+				elif cfg.MODEL.FLOATX == "float64":
+					pool_loss = np.float64('NaN')
+				else:
+					raise ValueError("Unknown Value for ", cfg.MODEL.FLOATX)
+
 			full_loss = self.batch_l2_loss(x,y)
 			loss = [full_loss, seed_loss, pool_loss]
 
@@ -423,42 +454,32 @@ class Trainer:
 		@tf.function
 		def apply_grad(x, y):
 
+			# only used if cfg.extra.log_layers is active
 			
-			log = {
-			"cnn":{
-				"max":[],
-				"min":[],
-				"mean":[]},
-			"in":{
-				"max":[],
-				"min":[],
-				"mean":[]},
-			"out":{
-				"max":[],
-				"min":[],
-				"mean":[]}
-			}
 
 			with tf.GradientTape() as g:
+				log = []
 				# TODO tf range is actually slower than writing it out...
 				for i in tf.range(self.num_ca_steps):
-					if cfg.EXTRA.LOG_LAYERS:
-						log["in"]["max"].append(np.amax(x.numpy()))
-						log["in"]["min"].append(np.amin(x.numpy()))
-						log["in"]["mean"].append(np.mean(x.numpy()))
-
-					out = self.ca(x)
-					x, cnn_l = out[0], out[1]
 
 					if cfg.EXTRA.LOG_LAYERS:
-						log["out"]["max"].append(np.amax(x.numpy()))
-						log["out"]["min"].append(np.amin(x.numpy()))
-						log["out"]["mean"].append(np.mean(x.numpy()))
+						out = self.ca(x)
+						x = out[0]
 
-						log["cnn"]["max"].append(np.amax(cnn_l.numpy()))
-						log["cnn"]["min"].append(np.amin(cnn_l.numpy()))
-						log["cnn"]["mean"].append(np.mean(cnn_l.numpy()))
-					
+						# TODO could be outsorced
+						# TODO could add min max and mean here
+						log.append([layer for layer in out[-1]])
+
+						"""
+						for layer in out:
+							if layer[0] in log:
+								log[layer[0]].append(layer[1].numpy())
+							else:
+								log[layer[0]] = [layer[1].numpy()]
+						"""
+					else:
+						x = self.ca(x)
+
 				# TODO is there a better way?
 				losses = self.get_losses(x, y)
 
@@ -468,13 +489,14 @@ class Trainer:
 			# As weigth normalization after applying the update
 			# TODO if Update gate is true, only a single value will be normed to {-1,1}
 			if cfg.TRAIN.LAYER_NORM:
-				normed_grads = []
-				for layer_grad in grads:
-					normed_grads.append(layer_grad / (tf.norm(layer_grad) + 1e-8))
+				# This implementation is only useful if I want to remove {-1,1} updates
+				# normed_grads = []
+				# for layer_grad in grads:
+				#	normed_grads.append(layer_grad / (tf.norm(layer_grad) + 1e-8))
 
-				grads = normed_grads
+				# grads = normed_grads
 				# Old implementation
-				# grads = [g/(tf.norm(g)+1e-8) for g in grads]
+				grads = [g/(tf.norm(g)+1e-8) for g in grads]
 			self.optimizer.apply_gradients(zip(grads, self.ca.trainable_variables))
 			return x, losses, grads, log
 		return apply_grad

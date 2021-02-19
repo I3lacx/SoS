@@ -63,6 +63,42 @@ def show_simple_run(x0, ca, num_steps=20, batch=0, only_alive_cells=False, white
 	run = Video("./_autoplay.mp4", width=320, height=220, html_attributes="autoplay controls", embed=True)
 	return run
 
+def show_batch_run(x_dict, ca, num_steps, only_alive_cells=False, white_background=False):
+	# Can be too memory heavy...
+	# *4 because of zoom
+
+	x = []
+	key_list = []
+	for key, value in x_dict.items():
+		x.append(value)
+		key_list.append(key)
+	x = np.stack(x, axis=0)
+
+	if only_alive_cells:
+		full_step_array = np.empty([num_steps] + [x.shape[0]] + [x.shape[1] * 4] + [x.shape[2] * 4] + [1])
+	else:
+		full_step_array = np.empty([num_steps] + [x.shape[0]] + [x.shape[1] * 4] + [x.shape[2] * 4] + [3])
+	for i in range(num_steps):
+		if only_alive_cells:
+			if i == 0:
+				res = utils.zoom((x[:, :, :, 3] > 0.1).astype(np.float32), axis_offset=1)
+			else:
+				res = utils.zoom((x[:, :, :, 3].numpy() > 0.1).astype(np.float32), axis_offset=1)
+			full_step_array[i] = res
+		else:
+			res = utils.zoom(rgba_to_rgb(ca.classify(x), white_background=white_background), axis_offset=1)
+			full_step_array[i] = res
+		x = ca(x)
+
+	for batch_idx in range(full_step_array.shape[1]):
+		with VideoWriter("_autoplay.mp4") as vid:
+			for step_idx in range(full_step_array.shape[0]):
+				vid.add(full_step_array[step_idx, batch_idx])
+		run = Video("./_autoplay.mp4", width=320, height=220, html_attributes="autoplay controls", embed=True)
+		print(key_list[batch_idx])
+		show(run)
+
+
 def clear():
 	""" Calls IPython clear_output function to clear current outputs """
 	clear_output(wait=True)
@@ -81,7 +117,7 @@ def plot_loss(loss_log, log_scale=False, return_plot=False, plot_mean=True, name
 		smoothed_y = smooth(loss_log, weight=smoothed)
 		fig = go.Scatter(y=smoothed_y, name=str(name+"_s"))
 	else:
-		fig = go.Scatter(y=loss_log, name=str(name))
+		fig = go.Scatter(y=loss_log, name=str(name), visible="legendonly")
 
 	if return_plot:
 		return fig
@@ -126,6 +162,31 @@ def plot_loss(loss_log, log_scale=False, return_plot=False, plot_mean=True, name
 	# TODO log_scale
 	"""
 
+def plot_input_layer(arr, infos=None, return_fig=False, render_in_browser=True):
+  # x expected shape: W,H,16
+  fig = make_subplots(rows=4, cols=4)
+  x = arr
+  
+  for i in range(0,4):
+    for j in range(0,4):
+      cur_img = x[:,:,i*4+j]
+      title = f"max:{np.amax(cur_img):.4f} min:{np.amin(cur_img):.4f} mean:{np.mean(cur_img):.4f}"
+      plot = px.imshow(cur_img, labels=dict(x=title))
+      
+      fig.add_traces(plot.data, rows=i+1, cols=j+1)
+      # plt.title(f"max:{np.amax(x[:,:,i]):.4f} min:{np.amin(x[:,:,i]):.4f} mean:{np.mean(x[:,:,i]):.4f}")
+  # fig.update_layout(coloraxis_showscale=False)
+  if infos:
+  	fig.update_layout(title=f"train_step:{infos[0]}, ca_step:{infos[1]}, layer:{infos[2]}, batch:{infos[3]}")
+
+  if render_in_browser:
+  	pio.renderers.default = "browser"
+
+  if return_fig:
+  	return fig
+  else:
+  	fig.show()
+
 
 # TODO does not seem suuper efficient -> also should be in utils not in display
 def smooth(scalars, weight):  # Weight between 0 and 1
@@ -150,15 +211,79 @@ def plot_session(sess_id):
 
 import textwrap
 
+
+def make_small_fig(y, title="", return_fig=True):
+	fig = go.Figure(go.Scatter(y=y))
+
+	if title == "":
+		title = utils.get_cfg_infos()
+
+	fig.layout.title.text = "<br>".join(textwrap.wrap(title, width=120))
+	fig.layout.title.font.size = 12
+
+	if return_fig:
+		return fig
+	else: 
+		fig.show()
+
+
+def plot_min_max_mean(val_dict, title=""):
+	fig = go.Figure()
+	plot2 = go.Scatter(y=val_dict["max"], name="maxs")
+	plot3 = go.Scatter(y=val_dict["min"], name="mins")
+	plot4 = go.Scatter(y=val_dict["mean"], name="means")
+
+	fig.add_traces([plot2, plot3, plot4])
+	fig.update_layout(title=title)
+	return fig
+
+
+def plot_train_and_val_loss(train_losses, val_loss_dict, smoothing_weight=0.8, y_range=None,
+	title_text=utils.get_cfg_infos(), textwrap_width=120):
+	""" Standard call during training to plot train and validation in one plot
+	Replaces the plot_losses call
+	train_losses is expected to be an array with shape [1,N] with N number of steps
+	"""
+
+	train_losses = np.array(train_losses)
+	assert train_losses.shape[1] == 1, "Not implemented for more losses!"
+
+	fig = go.Figure()
+
+	# Add train/train_smooth plot
+	trace = plot_loss(train_losses[:,0], return_plot=True, plot_mean=False, name="train")
+	smooth = plot_loss(train_losses[:,0], return_plot=True, name="train", smoothed=smoothing_weight)
+	fig.add_trace(trace)
+	fig.add_trace(smooth)
+
+	step_size = cfg.EXTRA.VAL_LOG_INTERVALL
+
+	# TODO make some visible from the start?
+	for key, value in val_loss_dict.items():
+		x = np.arange(0, len(value) * step_size, step_size)
+		trace = go.Scatter(x=x, y=value, name=key, visible="legendonly")
+		fig.add_trace(trace)
+
+	fig.layout.title.text = "<br>".join(textwrap.wrap(title_text, width=textwrap_width))
+	fig.layout.title.font.size = 12
+	# fig.layout.uniformtext.mode = "show"
+
+	if y_range:
+		fig.update_yaxes(range=y_range)
+
+	fig.show()
+
 def plot_losses(loss_logs, log_scale=False, return_plot=False, plot_mean=True,
- smoothing_weight=0.8, title_text=utils.get_cfg_infos(), textwrap_width=120):
+ smoothing_weight=0.8, title_text=utils.get_cfg_infos(), textwrap_width=120, 
+ y_range=None):
 	""" loss logs to plot in a single graph. 
 	Expected shape: [n, number_losses] """
 	
 	loss_logs = np.array(loss_logs)
 
 	fig = go.Figure()
-	names = ["total", "seed", "pool"]
+	# Todo seed and pool values old, only total working now, need to change for validation
+	names = ["total"]
 	for i in range(np.shape(loss_logs)[1]):
 		trace = plot_loss(loss_logs[:,i], return_plot=True, plot_mean=False, name=names[i])
 		smooth = plot_loss(loss_logs[:,i], return_plot=True, name=names[i], smoothed=smoothing_weight)
@@ -169,6 +294,8 @@ def plot_losses(loss_logs, log_scale=False, return_plot=False, plot_mean=True,
 	fig.layout.title.font.size = 12
 	# fig.layout.uniformtext.mode = "show"
 
+	if y_range:
+		fig.update_yaxes(range=y_range)
 	if log_scale:
 		fig.update_yaxes(type="log")
 	"""
@@ -220,22 +347,13 @@ def rgba_to_rgb(rgba_img, white_background=False):
 		return rgba_img[...,:3] * rgba_img[...,3:4]
 
 
-def visualize_batch(ca, x0, x, step_i):
-	if cfg.WORLD.TASK["TASK"] == "classify":
-		vis0 = np.hstack(classify_and_color(ca, x0).numpy())
-		vis1 = np.hstack(classify_and_color(ca, x).numpy())
-		vis = np.vstack([vis0, vis1])
-		# imwrite('train_log/batches_%04d.jpg'%step_i, vis)
-		print('batch (before/after):')
-	elif cfg.WORLD.TASK["TASK"] == "growing":
-		# Classify in growing, returns RGBA layers
-		vis_x = np.hstack(ca.classify(x))
-		vis_x0 = np.hstack(ca.classify(x0))
-		print(vis_x.shape)
-		vis = np.vstack([vis_x0, vis_x])
-	else:
-		raise ValueError()
-
+def visualize_batch(ca, x0, x, step_i, white_background=False):
+	# Classify in growing, returns RGBA layers
+	vis_x = np.hstack(rgba_to_rgb(ca.classify(x), white_background))
+	vis_x0 = np.hstack(rgba_to_rgb(ca.classify(x0), white_background))
+	print(vis_x.shape)
+	vis = np.vstack([vis_x0, vis_x])
+	
 	imshow(vis)
 
 def visdom_plotly(vis, fig):
@@ -332,3 +450,16 @@ def plot_collection_of_avg_plots(plots, render_in_browser=True):
 	fig.update_layout(height=900, width=1300, title_text="Multiple Subplots with Titles")
 
 	fig.show()
+
+
+def plot_execution_time():
+	""" Plots execution time for tracked functions using the timeit method 
+	Only works if cfg.EXTRA.USE_TIMER was active before """
+	# TODO only works with plt for now, would be nice to do it in plotly
+
+	for key in utils.total_time_dict.keys():
+		print(key)
+		print("mean:", np.mean(utils.total_time_dict[key][1:]))
+		# Removing the first as most time too long and not representative
+		plt.boxplot(utils.total_time_dict[key][1:])
+		plt.show()

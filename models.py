@@ -36,6 +36,7 @@ class CAModel(tf.keras.Model):
 		self.add_noise = add_noise
 		self.env_size = env_size
 
+		# summary writer in the model used to log weights histogram during training
 		self.summary_writer = summary_writer
 
 		self.dmodel = self.get_dmodel()
@@ -47,14 +48,14 @@ class CAModel(tf.keras.Model):
 	def initialize_model(self):
 
 		# Single call to build keras model and create graph
-		self(tf.keras.Input(shape=(cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)))
+		self(tf.keras.Input(shape=(cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N)))
 		
 		if cfg.EXTRA.TB_GRAPH:
 			print("--- THIS FUNCTION CALLS FIT TO CREATE THE TB GRAPH ---")
 			print("RESET THE RUN TO ASSURE UNPAMPERED PERFORMANCE!")
 
-			x_in = np.zeros((1, cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N))
-			y_in = np.zeros((1, cfg.WORLD.SIZE, cfg.WORLD.SIZE, 16))
+			x_in = np.zeros((1, cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N))
+			y_in = np.zeros((1, cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, 16))
 			tb_callback = tf.keras.callbacks.TensorBoard(log_dir="graph_log/")
 			self.compile(optimizer='adam', loss='mse')
 			self.fit(x_in, y_in, batch_size=1, epochs=1, callbacks=tb_callback)
@@ -63,12 +64,20 @@ class CAModel(tf.keras.Model):
 	def get_dmodel(self):
 		""" returns dmodel based on cfg (number of layers and filter size)
 		cur_step used to log w value """
-		input_shape = (cfg.WORLD.SIZE, cfg.WORLD.SIZE, cfg.MODEL.CHANNEL_N)
+		input_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N)
 		input_layer = tf.keras.Input(shape=input_shape)
 		
+
+		# if cfg.TRAIN.FORCE_ALIVE:
+		#	input_layer[:, cfg.DATA.GRID_SIZE//2, cfg.DATA.GRID_SIZE//2, 3:] = 1.
+
+
 		current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=tf.nn.relu,
 								padding="SAME", name="perceive")(input_layer)
 
+
+		if cfg.EXTRA.LOG_LAYERS:
+			output_layers = [("input_layer", input_layer), ("perceive", current_layer)]
 
 		previous_layer = current_layer
 		for i in range(cfg.MODEL.HIDDEN_LAYERS):
@@ -81,6 +90,10 @@ class CAModel(tf.keras.Model):
 				current_layer = tf.keras.layers.BatchNormalization()(current_layer)
 
 			current_layer = tf.keras.layers.ReLU()(current_layer)
+
+			if cfg.EXTRA.LOG_LAYERS:
+				output_layers.append(f"hidden_{i}", current_layer)
+
 			previous_layer = current_layer
 
 
@@ -98,6 +111,9 @@ class CAModel(tf.keras.Model):
 								kernel_initializer=tf.keras.initializers.RandomNormal(mean=0, stddev=0.025))(previous_layer)
 		else:
 			raise ValueError(f"Initializer {cfg.MODEL.LAST_LAYER_INIT}, not implemented")
+
+		if cfg.EXTRA.LOG_LAYERS:
+			output_layers.append(("update", final_layer))
 
 		if cfg.MODEL.GRU: 
 			# Full GRU implemenetation, will ignore cfg.MODEL.UPDATE_GATE
@@ -135,9 +151,57 @@ class CAModel(tf.keras.Model):
 			# h_t_prime = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="h_t_prime"))(h_t_prime)
 			final_layer = update_gate * input_layer + (1 - update_gate) * h_t_prime
 
+			if cfg.EXTRA.LOG_LAYERS:
+				output_layers.append(("update_gate", update_gate))
+				output_layers.append(("reset_gate", reset_gate))
+				output_layers.append(("h_t_prime", h_t_prime))
+				output_layers.append(("final_layer", final_layer))
+
 		else: 
-			if cfg.MODEL.UPDATE_GATE:
+			if cfg.MODEL.RESET_GATE:
+				# Using the result of the Cnn layer
+				# Todo swtiched out sigmoid with clipping
+				if cfg.MODEL.RESET_ACTIVATION == "clipping":
+					w = Conv2D(1, 1, activation=None, name="reset_gate")(current_layer)
+					w = tf.clip_by_value(w, 0., 1.)
+				elif cfg.MODEL.RESET_ACTIVATION == "sigmoid":
+					w = Conv2D(1, 1, activation="sigmoid", name="reset_gate")(current_layer)
+
+				one = tf.ones_like(w, dtype=cfg.MODEL.FLOATX)
+				negated_w = tf.keras.layers.Add()([one, tf.math.negative(w)])
+
+				# gaussian noise
+				# zeros = tf.zeros_like(w, dtype=tf.float32)
+				# TODO test for good noise values
+				# gaussian_noise = tf.keras.layers.GaussianNoise(1e-5, trainable=False)(zeros)
+
+				# 
+				gaussian_noise = tf.random.normal(shape=tf.shape(w), mean=0.0, 
+					stddev=cfg.MODEL.RESET_NOISE, dtype=cfg.MODEL.FLOATX)
+				noise = tf.keras.layers.multiply([w, gaussian_noise])
+
+				# TODO hack to overcome the setting the set world state problem
+				added_with_input_layer = tf.keras.layers.Add()([final_layer, input_layer])
+
+				final_layer_reduced = tf.keras.layers.multiply([negated_w, added_with_input_layer])
+
+				final_layer = tf.keras.layers.Add()([final_layer_reduced, noise])
+
+				if cfg.EXTRA.LOG_LAYERS:
+					output_layers.append(("w", w))
+					output_layers.append(("one", one))
+					output_layers.append(("neg_w", negated_w))
+					# output_layers.append(("zeros", zeros))
+					output_layers.append(("ga_noise", gaussian_noise))
+					output_layers.append(("noise", noise))
+					output_layers.append(("added with inpiut", added_with_input_layer))
+					output_layers.append(("reduced final", final_layer_reduced))
+					output_layers.append(("result layer", final_layer))
+
+			# TODO ti can merge a lot of the w stuff with upper systems
+			elif cfg.MODEL.UPDATE_GATE:	
 				# Sigmoid because it has to be between 0 and 1
+				# TODO why input layer, current layer makes more sense?...
 				w = Conv2D(1, 1, activation="sigmoid", name="update_gate")(input_layer)
 				w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="w"))(w)
 				
@@ -149,7 +213,7 @@ class CAModel(tf.keras.Model):
 				# self.update_gate_log.append(w.numpy())
 
 				# tf.print(w.numpy())
-				one = tf.ones_like(w, dtype=tf.float32)
+				one = tf.ones_like(w, dtype=cfg.MODEL.FLOATX)
 				l1 = tf.keras.layers.multiply([w, input_layer])
 				negated_w = tf.keras.layers.Add()([one, tf.math.negative(w)])
 				# negated_w = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="neg_w"))(negated_w)
@@ -163,9 +227,28 @@ class CAModel(tf.keras.Model):
 					final_layer = tf.keras.layers.Add(name="Super_skip_layer")([l1, final_layer])
 				# final_layer = tf.keras.layers.Lambda(self.print_layer, arguments=dict(text="final_layer"))(final_layer)
 
-		# TODO this is the most ugliest thing I have ever seen
-		model = tf.keras.models.Model(name="dmodel", inputs=input_layer, outputs=[final_layer, current_layer])
-		# print(f"-\n\n {model.output} \n\n")
+				if cfg.EXTRA.LOG_LAYERS:
+					output_layers.append(("w", w))
+					output_layers.append(("one", one))
+					output_layers.append(("neg_w", negated_w))
+					output_layers.append(("l1", l1))
+					output_layers.append(("result layer", final_layer))
+
+
+		# Switching the model outputs based on configs
+		# TODO likely only links the second to last layer instead of all layers
+		if cfg.EXTRA.LOG_LAYERS:
+			# final layer should alwalys be the last element in this list
+			# TODO this forcful removes the names in the lists, because tf doesnt allow it
+			new_output_layers = []
+			for layer in output_layers:
+				new_output_layers.append(layer[1])
+
+			model = tf.keras.models.Model(name="dmodel_log_layers", inputs=input_layer,
+				outputs=new_output_layers)
+		else:
+			model = tf.keras.models.Model(name="dmodel", inputs=input_layer, outputs=final_layer)
+
 		return model
 
 	def _get_name_list_of_model(self):
@@ -217,7 +300,11 @@ class CAModel(tf.keras.Model):
 	def call(self, x, fire_rate=None, manual_noise=None):
 		env, state = tf.split(x, [self.env_size, self.channel_n], -1)
 
-		ds, cnn_out = self.dmodel(x)
+		if cfg.EXTRA.LOG_LAYERS:
+			all_layers_output = self.dmodel(x)
+			ds = all_layers_output[-1]
+		else:
+			ds = self.dmodel(x)
 
 		# print(self.w)
 		# print(type(self.dmodel))
@@ -231,14 +318,11 @@ class CAModel(tf.keras.Model):
 			# dmodel is its first and only layer...
 			#tf.print(self.layers[0].get_layer("update_gate").output)
 
-
-
 		#if cfg.MODEL_TASK == "growing":
 		#	return x + self.test(x)
-
 		if self.add_noise:
 			if manual_noise is None:
-				residual_noise = tf.random.normal(tf.shape(ds), 0., 0.02)
+				residual_noise = tf.random.normal(tf.shape(ds), 0., 0.02, dtype=cfg.MODEL.FLOATX)
 			else:
 				residual_noise = manual_noise
 			ds += residual_noise
@@ -250,23 +334,30 @@ class CAModel(tf.keras.Model):
 		# tf.print("state type", type(state))
 		# TODO tested for env of size 1, this is hotfix to make it work for RGB
 		# For now I don't need it. In case of Emoji growing, its 0
-		if cfg.WORLD.TASK["TASK"] == "classify":
-			living_mask = tf.math.reduce_sum(env, -1, keepdims=True) > 0.1
-		elif cfg.WORLD.TASK["TASK"] == "growing":
-			# TODO how does env play into the living mask?
-			if cfg.WORLD.LIVING_MASK:
-				living_mask = self.get_living_mask(state)
-			else:
-				living_mask = tf.constant(1)
-			# living_mask = tf.math.reduce_sum(x[:,:,:,:3], -1, keepdims=True) >= 0
-			# living_mask = tf.math.reduce_sum(x[:,:,:,:3], -1, keepdims=True) > 0.1
+		
+		# TODO how does env play into the living mask?
+		if cfg.WORLD.LIVING_MASK:
+			living_mask = self.get_living_mask(state)
 		else:
-			raise ValueError()
+			living_mask = tf.constant(True, dtype=bool)
+		# living_mask = tf.math.reduce_sum(x[:,:,:,:3], -1, keepdims=True) >= 0
+		# living_mask = tf.math.reduce_sum(x[:,:,:,:3], -1, keepdims=True) > 0.1
+
+		# force middle cell to always be alive
+		if cfg.TRAIN.FORCE_ALIVE:
+			# print(living_mask.shape)
+			# TODO unable to make it more dynamic...
+			middle_alive = np.zeros((8,30,30,1))
+			middle_alive[:, cfg.DATA.GRID_SIZE//2, cfg.DATA.GRID_SIZE//2] = True
+			middle_alive = tf.constant(middle_alive, dtype=bool)
+			living_mask = living_mask | middle_alive
+			# alpha[:, cfg.DATA.GRID_SIZE//2, cfg.DATA.GRID_SIZE//2, :] = 0.1
+
 
 		residual_mask = update_mask & living_mask
 
 		# Directly assign the world state instead of updating it
-		if cfg.MODEL.SET_WORLD_STATE or cfg.MODEL.GRU:
+		if cfg.MODEL.SET_WORLD_STATE or cfg.MODEL.GRU or cfg.MODEL.RESET_GATE:
 			# In order to apply the mask, only the active channels will be updated
 			# TODO this is a np operation, which should be converted to a tf operation, but not tested!
 			# This will update all values in state where mask is True and set values to ds
@@ -274,10 +365,16 @@ class CAModel(tf.keras.Model):
 			# np.putmask(state, residual_mask, ds)
 			# state = ds
 		else:
-			ds *= tf.cast(residual_mask, tf.float32)
+			ds *= tf.cast(residual_mask, cfg.MODEL.FLOATX)
 			state += ds
 
-		return tf.concat([env, state], -1), cnn_out
+		# additonal output if log layers is active
+		if cfg.EXTRA.LOG_LAYERS:
+			all_layers_output.append(residual_mask)
+			all_layers_output.append(tf.concat([env, state], -1))
+			return tf.concat([env, state], -1), all_layers_output
+		else:
+			return tf.concat([env, state], -1)
 
 	# @tf.function
 	def initialize(self, images):
@@ -303,22 +400,14 @@ class CAModel(tf.keras.Model):
 
 	# @tf.function
 	def classify(self, x):
-		""" Not perse classification, depends on the task. Returns lossable channels """
-		if cfg.WORLD.TASK["TASK"] == "classify":
-			# The last 10 layers are the classification predictions, one channel
-			# per class. Keep in mind there is no "background" class,
-			# and that any loss doesn't propagate to "dead" pixels.
-			return x[:,:,:,-10:]
-		elif cfg.WORLD.TASK["TASK"] == "growing":
-			# First 4 Channels are RGBA
-			return x[:,:,:,:4]
-		else:
-			raise ValueError(f"Task: {cfg.WORLD.TASK['TASK']} not implemented")
+		""" Returns lossable RGBA channels """
+		return x[:,:,:,:4]
 
 	@tf.function
 	def get_living_mask(self, x):
 		alpha = x[:, :, :, 3:4]
-		return tf.nn.max_pool2d(alpha, 3, [1, 1, 1, 1], 'SAME') > 0.1
+
+		return tf.nn.max_pool2d(alpha, 3, [1, 1, 1, 1], 'SAME') >= 0.1
 
 
 	def summary(self):
@@ -349,67 +438,3 @@ class CAModel(tf.keras.Model):
 
 # CAModel().perceive.summary()
 # CAModel().dmodel.summary()
-
-# TODO should this be here or in an evaluation file? Like a trainer?
-
-# @title Evaluation functions
-def eval_perform_steps(ca, x, yt, num_steps):
-	yt_label = tf.argmax(yt, axis=-1)
-
-	live_mask = x[..., 0] > 0.1
-	live_mask_fl = tf.expand_dims(tf.cast(live_mask, tf.float32), -1)
-	dead_channel = tf.cast(x[..., :1] <= 0.1, tf.float32)
-
-	# for now the metric is aggregating everything.
-	total_count = tf.reduce_sum(tf.cast(live_mask, tf.float32))
-
-	avg_accuracy_list = []
-	avg_total_agreement_list = []
-	for _ in range(1, num_steps + 1):
-		x = ca(x)
-
-		y = ca.classify(x)
-		y_label = tf.argmax(y, axis=-1)
-
-		correct = tf.equal(y_label,  yt_label) & live_mask
-		total_correct = tf.reduce_sum(tf.cast(correct, tf.float32))
-		avg_accuracy_list.append((total_correct/total_count * 100).numpy().item())
-
-		# agreement metrics
-		# Important to exclude dead cells:
-		y = y * live_mask_fl
-		y_label_plus_mask = tf.argmax(tf.concat([y, dead_channel], -1), axis=-1)
-		all_counts = []
-		for idx in range(10):
-			count_i = tf.reduce_sum(
-					tf.cast(tf.equal(y_label_plus_mask, idx), tf.int32), axis=[1,2])
-			all_counts.append(count_i)
-		all_counts_t = tf.stack(all_counts, 1)
-		# Now the trick is that if there is a total agreement, their sum is the same
-		# as their max.
-		equality = tf.equal(tf.reduce_max(all_counts_t, axis=1),
-												tf.reduce_sum(all_counts_t, axis=1))
-		sum_agreement = tf.reduce_sum(tf.cast(equality, tf.float32))
-		avg_total_agreement_list.append(sum_agreement.numpy().item() / y.shape[0] * 100)
-
-	return avg_accuracy_list, avg_total_agreement_list
-
-def eval_batch_fn(ca, x_test, y_test, num_steps, mutate):
-	x = ca.initialize(x_test)
-	yt = y_test
-
-	avg_acc_l_1, avg_tot_agr_l_1 = eval_perform_steps(ca, x, yt, num_steps)
-	if not mutate:
-		return avg_acc_l_1, avg_tot_agr_l_1
-	# Accuracy after mutation!
-	new_idx = np.random.randint(0, x_test.shape[0]-1, size=x_test.shape[0])
-	new_x, yt = x_test[new_idx], y_test[new_idx]
-	new_x = tf.reshape(new_x, [-1, 28, 28, 1])
-	mutate_mask = tf.cast(new_x > 0.1, tf.float32)
-
-	x = tf.concat([new_x, x[:,:,:,1:] * mutate_mask], -1)
-
-	avg_acc_l_2, avg_tot_agr_l_2 = eval_perform_steps(ca, x, yt, num_steps)
-
-	return avg_acc_l_1 + avg_acc_l_2, avg_tot_agr_l_1 + avg_tot_agr_l_2
-

@@ -41,6 +41,34 @@ grid_plots_simple_nov = {
 	"2020_11_13/14_01_34": [4,4]
 }
 
+def background_options():
+	""" tf and np configs to be run in the background"""
+	tf.keras.backend.set_floatx(cfg.MODEL.FLOATX)
+
+	if cfg.EXTRA.LOG_LAYERS:
+		tf.config.run_functions_eagerly(True)
+	else:
+		tf.config.run_functions_eagerly(False)
+
+	if cfg.EXTRA.FIXED_SEED:
+		tf.random.set_seed(cfg.EXTRA.FIXED_SEED)
+		np.random.seed(cfg.EXTRA.FIXED_SEED)
+
+def get_current_time():
+	return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def get_summary_writers():
+	path = get_full_log_path() + '/logs/'
+	
+	train_log_dir = path + '/train'
+	val_log_dir = path + '/val'
+	test_log_dir = path + '/test'
+
+	train_summary_writer = tf.summary.create_file_writer(train_log_dir)
+	val_summary_writer = tf.summary.create_file_writer(val_log_dir)
+	test_summary_writer = tf.summary.create_file_writer(test_log_dir)
+
+	return train_summary_writer, val_summary_writer, test_summary_writer
 
 def get_auto_title():
 	""" generates automatic title based on config """
@@ -48,10 +76,27 @@ def get_auto_title():
 
 def get_cfg_infos():
 	""" creates small ish title str with important informations """
-	full_str = str(cfg.WORLD.__dict__) + str(cfg.MODEL.__dict__) + \
+	full_str = str(cfg.WORLD.__dict__) + str(cfg.DATA.__dict__) + str(cfg.MODEL.__dict__) + \
 						 str(cfg.TRAIN.__dict__) + str(cfg.EXTRA.__dict__)
 	return full_str
-	# return full_str
+	# return full_st
+
+def shape(arr):
+	""" Returns shape of array, len if list"""
+	if type(arr) == list:
+		return [len(arr)]
+	else:
+		return arr.shape
+
+def save_img_to_file(array_img, path):
+	""" saves image to file """
+	np_img = np.uint8(array_img * 255.)
+	img = PIL.Image.fromarray(np_img) 
+	img.save(path)
+
+
+def mmm(arr):
+	return np.amin(arr), np.mean(arr), np.amax(arr)
 
 # Wrapper to time functions
 # TODO save times of methods to some outside arary to look at later
@@ -129,9 +174,9 @@ def ensure_dir(path):
 
 
 # Todo what is that? -> I think just making the picture bigger
-def zoom(img, scale=4):
-	img = np.repeat(img, scale, 0)
-	img = np.repeat(img, scale, 1)
+def zoom(img, scale=4, axis_offset=0):
+	img = np.repeat(img, scale, 0 + axis_offset)
+	img = np.repeat(img, scale, 1 + axis_offset)
 	return img
 
 def np2pil(a):
@@ -281,40 +326,46 @@ def get_full_log_path():
 
 	return cur_path
 
-def save_cfg():
+def save_cfg(path=None):
 	""" 
 	Saves all config objects in bytes and all changed information as jsons
 	At LOG_PATH + date + time
 	"""
 
-	cur_path = get_full_log_path()
-	
+	if path is None:
+		path = get_full_log_path()
+
 	# Open and write into 'json' (not 100% json)
-	with open(cur_path + "diff.json", "w") as f:
+	with open(path + "diff.json", "w") as f:
 		for config_name in cfg.ALL_CONFIG_CLASSES:
 			f.write(f'{{"{config_name}":')
 			json.dump(getattr(cfg, config_name).__dict__, f)
 			f.write("}\n")
 
 	# Open and write into pickle file
-	with open(cur_path + "full_config.pkl", "wb") as f:
+	with open(path + "full_config.pkl", "wb") as f:
 		for config_name in cfg.ALL_CONFIG_CLASSES:
 			pickle.dump(getattr(cfg, config_name), f)
 
-	print("Successfully saved configs at: ", cur_path)
+	print("Successfully saved configs at: ", path)
 
 
-def save_fig(fig, name="fig", as_json=True, as_img=False):
-	full_path = cfg.EXTRA.LOG_PATH + cfg.EXTRA.SESSION_ID + "/"
+def save_fig(fig, name="fig", as_json=True, as_img=False, path=None):
+
+	if path is None:
+		path = cfg.EXTRA.LOG_PATH + cfg.EXTRA.SESSION_ID + "/"
 
 	if as_json:
-		fig.write_json(full_path + name + ".json")
+		fig.write_json(path + name + ".json")
 
 	if as_img:
+		full_path = path + name + ".png"
 		try:
-			fig.write_image(full_path + name + ".png")
+			fig.write_image(full_path)
 		except ValueError:
 			print("VALUE ERROR while writing the png")
+
+	print("Successfully saved figure at: ", full_path)
 
 
 def get_all_figs(sess_id, name="fig_"):
@@ -329,304 +380,3 @@ def get_all_figs(sess_id, name="fig_"):
     
   return figs
 
-
-
-def create_js_drawing():
-	# TODO this does not work, just put in utils and remove from main screen
-	raise NotImplementedError("Not working, as js errors, here to be somewhere")
-	# Careful when running this as js can destroy the whole jupyter Notebook!
-
-	#@title TensorFlow.js Demo Full whiteboard {run:"auto", vertical-output: true}
-	#@markdown Select "CHECKPOINT" model to load the checkpoint created by running 
-	#@markdown cells from the "Training" section of this notebook.
-	#@markdown Technical note: CE models should be rendered differently to avoid
-	#@markdown black pixels showing for low magnitude.
-	import IPython.display
-	import glob
-	import tensorflow as tf
-
-	# TODO this loading could be in utils:
-	samples_str = datasets.get_samples_str(x_train, y_train)
-
-	#@markdown draw with left click, hold shift for erasing
-
-	# Load model from ckpt:
-	# glob and stuff to load last json file (highest num_steps, only works with single model name here)
-	last_checkpoint_fn = sorted(glob.glob('models/*.json'))[-1]
-	model_str = open(last_checkpoint_fn).read()
-
-
-	data_js = '''
-		window.GRAPH_URL = URL.createObjectURL(new Blob([`%s`], {type: 'application/json'}));
-		window.SAMPLES = %s
-	'''%(model_str, samples_str)
-
-	display(IPython.display.Javascript(data_js))
-
-	IPython.display.HTML(js_script_drawing)
-
-
-
-js_script_drawing = '''
-<script src=\"https://unpkg.com/@tensorflow/tfjs@latest/dist/tf.min.js\"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/cash/4.1.2/cash.min.js"></script>
-<div class="slidecontainer">
-		brushSize:
-		<input type="range" min="1" max="10" value="4" class="slider" id="brushSlider">
-		<span id='radius'>2.5</span>
-</div>
-<canvas id='canvas' style="border: 1px solid black; image-rendering: pixelated;"></canvas>
-<script>
-import '@tensorflow/tfjs-backend-wasm';
-	"use strict";
-
-	// Adds the WASM backend to the global backend registry.
-
-	// Set the backend to WASM and wait for the module to be ready.
-const main = async () => {
-
-	const sleep = (ms)=>new Promise(resolve => setTimeout(resolve, ms));
-	
-	const parseConsts = model_graph=>{
-		const dtypes = {'DT_INT32':['int32', 'intVal', Int32Array],
-										'DT_FLOAT':['float32', 'floatVal', Float32Array]};
-		
-		const consts = {};
-		model_graph.modelTopology.node.filter(n=>n.op=='Const').forEach((node=>{
-			const v = node.attr.value.tensor;
-			const [dtype, field, arrayType] = dtypes[v.dtype];
-			if (!v.tensorShape.dim) {
-				consts[node.name] = [tf.scalar(v[field][0], dtype)];
-			} else {
-				const shape = v.tensorShape.dim.map(d=>parseInt(d.size));
-				let arr;
-				if (v.tensorContent) {
-					const data = atob(v.tensorContent);
-					const buf = new Uint8Array(data.length);
-					for (var i=0; i<data.length; ++i) {
-						buf[i] = data.charCodeAt(i);
-					}
-					arr = new arrayType(buf.buffer);
-				} else {
-					const size = shape.reduce((a, b)=>a*b);
-					arr = new arrayType(size);
-					arr.fill(v[field][0]);
-				}
-				consts[node.name] = [tf.tensor(arr, shape, dtype)];
-			}
-		}));
-		return consts;
-	}
-	
-	let paused = false;
-	let visibleChannel = -1;
-	let firingChance = 0.5;
-	let drawRadius = 2.5;
-
-	$('#brushSlider').on('input', e=>{
-			drawRadius = parseFloat(e.target.value)/2.0;
-			$('#radius').text(drawRadius);
-	});
-
-	const colorLookup = tf.tensor([
-			[128, 0, 0],
-			[230, 25, 75],
-			[70, 240, 240],
-			[210, 245, 60],
-			[250, 190, 190],
-			[170, 110, 40],
-			[170, 255, 195],
-			[165, 163, 159],
-			[0, 128, 128],
-			[128, 128, 0],
-			[0, 0, 0], // This is the default for digits.
-			[255, 255, 255] // This is the background.
-			])
-
-	let backgroundWhite = true;
-
-
-	const run = async () => {
-			const r = await fetch(GRAPH_URL);
-			const consts = parseConsts(await r.json());
-
-			//const samples = tf.tensor(SAMPLES);
-			//console.log(samples);
-
-			const model = await tf.loadGraphModel(GRAPH_URL);
-
-			const samples = tf.tensor(SAMPLES);
-			//const samples = tf.zeros([2,5, 28, 28]);
-
-			console.log("Loaded model")
-			Object.assign(model.weights, consts);
-			// samples.gather(tf.range(0, 4, 1, 'int32')
-			const D = 28 * 5;
-			const flatState = tf.concat([
-				samples.reshape([2,5, 28, 28])
-					.transpose([0,2,1,3]).reshape([1, 2 * 28, D]),
-				tf.zeros([1, D-(28*2), D])],1);
-			console.log(flatState)
-			const state = tf.variable(
-				tf.concat([flatState.expandDims(3),
-										tf.zeros([1, D, D, 19])], 3));
-			const [_, h, w, ch] = state.shape;
-
-			const scale = 8;
-
-			const canvas = document.getElementById('canvas');
-			const ctx = canvas.getContext('2d');
-			canvas.width = w * scale;
-			canvas.height = h * scale;
-
-			const drawing_canvas = new OffscreenCanvas(w, h);
-			const draw_ctx = drawing_canvas.getContext('2d');
-
-			// Useful for understanding background color.
-			
-			//let blackAndWhite = tf.zeros();//.fill(0.01);
-			let arr = new Float32Array(h * w * 2);
-			arr.fill(0.01);
-			const blackAndWhiteFull = tf.tensor(arr, [1,h,w,2], tf.float32)
-
-			const drawCanvas = (imgd, e) => {
-					var matrix = [];
-					for(let i=0; i<imgd.width; i++) {
-							matrix[i] = [];
-							for(let j=0; j<imgd.height; j++) {
-									let intensity = imgd.data[(imgd.height*j*4 + i*4)];
-									// For drawing, we want to add shades of grey. For erasing, we don't.
-									if (!e.shiftKey) {
-										intensity *= (imgd.data[(imgd.height*j*4 + i*4 + 3)] / 255);
-									}
-									matrix[i][j] = intensity;
-							}
-					}
-
-					tf.tidy(() => {
-							const stroke = tf.tensor(matrix).transpose().toFloat().div(255.).expandDims(0).expandDims(3);
-							const stroke_pad = tf.concat([stroke, tf.zeros([1, h, w, ch-1])], 3);
-							const mask = tf.tensor(1.).sub(stroke);
-							if (e.shiftKey) {
-									state.assign(state.mul(mask));
-							} else {
-									state.assign(state.mul(mask).add(stroke_pad));
-							}
-					});
-
-					// Then clear the canvas.
-					draw_ctx.clearRect(0, 0, draw_ctx.canvas.width, draw_ctx.canvas.height);
-			}
-
-			const line = (x0, y0, x1, y1, r, e) => {
-					draw_ctx.beginPath();
-					draw_ctx.moveTo(x0, y0);
-					draw_ctx.lineTo(x1, y1);
-					draw_ctx.strokeStyle = "#ff0000";
-					// Erasing has a much larger radius.
-					draw_ctx.lineWidth = (e.shiftKey ? 5. * r : r);
-					draw_ctx.stroke();
-
-					const imgd = draw_ctx.getImageData(0, 0, draw_ctx.canvas.width, draw_ctx.canvas.height);
-					drawCanvas(imgd, e);
-			}
-
-
-			const circle = (x, y, r, e) => {
-					draw_ctx.beginPath();
-
-					const drawRadius = (e.shiftKey ? 5. * r : r) / 3.;
-
-					draw_ctx.arc(x, y, drawRadius, 0, 2 * Math.PI, false);
-					draw_ctx.fillStyle = "#ff0000";
-					draw_ctx.fill();
-					draw_ctx.lineWidth = 1;
-					draw_ctx.strokeStyle = "#ff0000";
-					draw_ctx.stroke();
-
-					const imgd = draw_ctx.getImageData(0, 0, draw_ctx.canvas.width, draw_ctx.canvas.height);
-					drawCanvas(imgd, e);
-			}
-
-			const draw_r = 2.0;
-
-
-			const getClickPos = e=>{
-					const x = Math.floor((e.pageX-e.target.offsetLeft) / scale);
-					const y = Math.floor((e.pageY-e.target.offsetTop) / scale);
-					return [x, y];
-			}
-
-			let lastX = 0;
-			let lastY = 0;
-
-			canvas.onmousedown = e => {
-					const [x, y] = getClickPos(e);
-					lastX = x;
-					lastY = y;
-					circle(x,y,drawRadius, e);
-			}
-			canvas.onmousemove = e => {
-					const [x, y] = getClickPos(e);
-					if (e.buttons == 1) {
-							line(lastX,lastY, x,y,drawRadius, e);
-					}
-					lastX = x;
-					lastY = y;
-			}
-			const render = async () => {
-				if (!paused) {
-					tf.tidy(() => {
-							state.assign(model.execute(
-								{ x: state,
-									fire_rate: tf.tensor(firingChance),
-									manual_noise: tf.randomNormal([1, h, w, ch-1], 0., 0.02)},
-								['Identity']));
-					});
-				}
-				const imageData = tf.tidy(() => {
-						let rgbaBytes;
-						let rgba;
-						if (visibleChannel < 0) {
-								const isGray = state.slice([0,0,0,0],[1, h, w, 1]).greater(0.1).toFloat();
-								const isNotGray = tf.tensor(1.).sub(isGray);
-
-								const bnwOrder = backgroundWhite ?  [isGray, isNotGray] : [isNotGray, isGray];
-								let blackAndWhite = blackAndWhiteFull.mul(tf.concat(bnwOrder, 3));
-
-								const grey = state.gather([0], 3).mul(255);
-								const rgb = tf.gather(colorLookup,
-																			tf.argMax(
-																			tf.concat([
-									state.slice([0,0,0,ch-10],[1,h,w,10]),
-									blackAndWhite], 3), 3));
-
-								rgba = tf.concat([rgb, grey], 3)
-						} else {
-								rgba = state.gather([visibleChannel, visibleChannel, visibleChannel], 3)
-									.pad([[0, 0], [0, 0], [0, 0], [0, 1]], 1).mul(255);
-						}
-						rgbaBytes = new Uint8ClampedArray(rgba.dataSync());
-
-						return new ImageData(rgbaBytes, w, h);
-				});
-				const image = await createImageBitmap(imageData);
-				//ctx.clearRect(0, 0, canvas.width, canvas.height);
-				ctx.fillStyle = backgroundWhite ? "#ffffff" : "#000000";
-				ctx.fillRect(0, 0, canvas.width, canvas.height);
-				ctx.imageSmoothingEnabled = false;
-				ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-
-				requestAnimationFrame(render);
-			}
-			render();
-	}
-
-	run();
-}
-main();
-	//tf.setBackend('wasm').then(() => main());
-
-	
-</script>
-'''
