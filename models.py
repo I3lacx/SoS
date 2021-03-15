@@ -21,6 +21,127 @@ from tensorflow.python.framework import convert_to_constants
 # import matplotlib.pyplot as plt
 # from visdom import Visdom
 
+import numpy as np
+
+
+def get_model(summary_writer, **kwargs):
+	""" uses current config settings to return model(s) """
+
+	if cfg.MODEL.NAME == "GANCA":
+		# TODO IMPORTANT THIS HAS TO BE COMPILED BEFORE PASSING!
+		disc = Discriminator()
+		opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.DISC_LR, beta_1=0.5)
+		disc.compile(loss='binary_crossentropy', optimizer=opt)
+		# opt = tf.keras.optimizers.Adam(lr=1e-4, beta_1=0.9)
+		# disc.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'])
+
+		if "ca" in kwargs:
+			ca = kwargs["ca"]
+		else:
+			ca = CAModel(summary_writer=summary_writer)
+
+		ganca = GANCAModel(disc, ca)
+		return disc, ganca
+		# opt = tf.keras.optimizers.Adam(lr=cfg.TRAIN.LR, beta_1=0.9)
+		# ganca.compile(loss='binary_crossentropy', optimizer=opt)
+	elif cfg.MODEL.NAME == "NCA":
+		ca = CAModel(summary_writer=summary_writer)
+		return ca
+	else:
+		raise ValueError(f"Name {cfg.MODEL.NAME} not found/ not implemneted")
+
+
+class GANCAModel(tf.keras.Model):
+	""" GAN architecture combined with NCA architecture """
+
+	def __init__(self, discriminator, ca):
+		super().__init__()
+		self.input_x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE,
+				cfg.WORLD.ENV_SIZE + cfg.MODEL.CHANNEL_N)
+
+		self.disc_model = discriminator
+		self.ca = ca
+		self.generator = self.get_generator()
+		self.model = self.get_ganca()
+
+		self(tf.keras.Input(shape=self.input_x_shape))
+
+
+	def get_generator(self):
+		input_layer = tf.keras.Input(shape=self.input_x_shape)
+
+		x = input_layer
+		# TODO random amount of hard coded steps..
+		# num_steps = np.random.randint(50,60)
+		num_steps = 40
+		for i in range(num_steps):
+			x = self.ca(x)
+		out = x
+
+		if cfg.MODEL.GANCA_EXTRA_LAYER:
+			# TODO trained layer here to reduce number of inputs to 4?
+			out = Conv2D(4, 1, activation=None)(out)
+		else:
+			# slice output to remove last layers
+			out = out[:, :, :, :4]
+
+
+		if cfg.MODEL.GANCA_TANH:
+			out = tf.keras.layers.Activation('tanh')(out)
+			
+		model = tf.keras.models.Model(input_layer, out)
+		return model
+
+	def get_ganca(self):
+		self.disc_model.trainable = False
+
+		ganca_in = self.generator.input
+		# TODO is this ok like this?
+		fake_img = self.generator.output
+		ganca_out = self.disc_model(fake_img)
+
+		model = tf.keras.models.Model(ganca_in, ganca_out)
+		# opt = tf.keras.optimizers.Adam(lr=0.0002, beta_1=0.5)
+		# model.compile(loss='binary_crossentropy', optimizer=opt)
+		return model
+
+	def call(self, x):
+		return self.model(x)
+
+class Discriminator(tf.keras.Model):
+	""" simple discriminator architecter for GANCA training """
+
+	def __init__(self):
+		super().__init__()
+		# Hard coded 3 to assume rgb image, maybe rgba?
+		self.input_x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, 4)
+
+		self.model = self.get_model()
+
+		# initiailize 
+		self(tf.keras.Input(shape=self.input_x_shape))
+
+
+	def get_model(self):
+		in_image = tf.keras.Input(shape=self.input_x_shape)
+		layer = tf.keras.layers.Conv2D(128, (3,3), strides=(2,2), padding='same')(in_image)
+		layer = tf.keras.layers.LeakyReLU(alpha=0.2)(layer)
+
+		layer = tf.keras.layers.Conv2D(128, (3,3), strides=(2,2), padding='same')(in_image)
+		layer = tf.keras.layers.LeakyReLU(alpha=0.2)(layer)
+
+		layer = tf.keras.layers.Flatten()(layer)
+		layer = tf.keras.layers.Dropout(0.4)(layer)
+
+		out_layer = tf.keras.layers.Dense(1, activation='sigmoid')(layer)
+
+		model = tf.keras.models.Model(in_image, out_layer)
+		return model
+
+	# @tf.function
+	def call(self, x):
+		return self.model(x)
+
 
 class CAModel(tf.keras.Model):
 	""" Two modes, growing and classify, two completely seperate tasks """
@@ -39,6 +160,10 @@ class CAModel(tf.keras.Model):
 		# summary writer in the model used to log weights histogram during training
 		self.summary_writer = summary_writer
 
+		# input_shape not possible as name, as blocked from keras duh
+		self.input_x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE,
+							cfg.WORLD.ENV_SIZE + cfg.MODEL.CHANNEL_N)
+
 		self.dmodel = self.get_dmodel()
 		self.weight_tensors = self._get_weight_tensors(cfg.EXTRA.LIST_OF_WEIGHT_NAMES)
 
@@ -48,14 +173,14 @@ class CAModel(tf.keras.Model):
 	def initialize_model(self):
 
 		# Single call to build keras model and create graph
-		self(tf.keras.Input(shape=(cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N)))
+		self(tf.keras.Input(shape=self.input_x_shape))
 		
 		if cfg.EXTRA.TB_GRAPH:
 			print("--- THIS FUNCTION CALLS FIT TO CREATE THE TB GRAPH ---")
 			print("RESET THE RUN TO ASSURE UNPAMPERED PERFORMANCE!")
 
 			x_in = np.zeros((1, cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N))
-			y_in = np.zeros((1, cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, 16))
+			y_in = np.zeros((1, cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N))
 			tb_callback = tf.keras.callbacks.TensorBoard(log_dir="graph_log/")
 			self.compile(optimizer='adam', loss='mse')
 			self.fit(x_in, y_in, batch_size=1, epochs=1, callbacks=tb_callback)
@@ -64,15 +189,20 @@ class CAModel(tf.keras.Model):
 	def get_dmodel(self):
 		""" returns dmodel based on cfg (number of layers and filter size)
 		cur_step used to log w value """
-		input_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N)
-		input_layer = tf.keras.Input(shape=input_shape)
+		input_layer = tf.keras.Input(shape=self.input_x_shape)
 		
 
 		# if cfg.TRAIN.FORCE_ALIVE:
-		#	input_layer[:, cfg.DATA.GRID_SIZE//2, cfg.DATA.GRID_SIZE//2, 3:] = 1.
+		#   input_layer[:, cfg.DATA.GRID_SIZE//2, cfg.DATA.GRID_SIZE//2, 3:] = 1.
 
 
-		current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=tf.nn.relu,
+
+		if cfg.MODEL.LEAKY_RELU:
+			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=None,
+									padding="SAME", name="perceive")(input_layer)
+			current_layer = tf.keras.layers.LeakyReLU()(current_layer)
+		else:
+			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=tf.nn.relu,
 								padding="SAME", name="perceive")(input_layer)
 
 
@@ -89,7 +219,10 @@ class CAModel(tf.keras.Model):
 			if cfg.MODEL.BATCH_NORM:
 				current_layer = tf.keras.layers.BatchNormalization()(current_layer)
 
-			current_layer = tf.keras.layers.ReLU()(current_layer)
+			if cfg.MODEL.LEAKY_RELU:
+				current_layer = tf.keras.layers.LeakyReLU()(current_layer)
+			else:
+				current_layer = tf.keras.layers.ReLU()(current_layer)
 
 			if cfg.EXTRA.LOG_LAYERS:
 				output_layers.append(f"hidden_{i}", current_layer)
@@ -199,7 +332,7 @@ class CAModel(tf.keras.Model):
 					output_layers.append(("result layer", final_layer))
 
 			# TODO ti can merge a lot of the w stuff with upper systems
-			elif cfg.MODEL.UPDATE_GATE:	
+			elif cfg.MODEL.UPDATE_GATE: 
 				# Sigmoid because it has to be between 0 and 1
 				# TODO why input layer, current layer makes more sense?...
 				w = Conv2D(1, 1, activation="sigmoid", name="update_gate")(input_layer)
@@ -298,7 +431,9 @@ class CAModel(tf.keras.Model):
 	# TODO this does't even make a difference, so just remove it?
 	@tf.function
 	def call(self, x, fire_rate=None, manual_noise=None):
-		env, state = tf.split(x, [self.env_size, self.channel_n], -1)
+		# last cfg.WORLD.ENV_SIZE channels are for the environment, unchangable
+		# different to the mnist case where the first channels were unchangable (the image)
+		state, env = tf.split(x, [self.channel_n, self.env_size], -1)
 
 		if cfg.EXTRA.LOG_LAYERS:
 			all_layers_output = self.dmodel(x)
@@ -319,7 +454,7 @@ class CAModel(tf.keras.Model):
 			#tf.print(self.layers[0].get_layer("update_gate").output)
 
 		#if cfg.MODEL_TASK == "growing":
-		#	return x + self.test(x)
+		#   return x + self.test(x)
 		if self.add_noise:
 			if manual_noise is None:
 				residual_noise = tf.random.normal(tf.shape(ds), 0., 0.02, dtype=cfg.MODEL.FLOATX)
@@ -371,10 +506,10 @@ class CAModel(tf.keras.Model):
 		# additonal output if log layers is active
 		if cfg.EXTRA.LOG_LAYERS:
 			all_layers_output.append(residual_mask)
-			all_layers_output.append(tf.concat([env, state], -1))
-			return tf.concat([env, state], -1), all_layers_output
+			all_layers_output.append(tf.concat([state, env], -1))
+			return tf.concat([state, env], -1), all_layers_output
 		else:
-			return tf.concat([env, state], -1)
+			return tf.concat([state, env], -1)
 
 	# @tf.function
 	def initialize(self, images):

@@ -63,40 +63,96 @@ def show_simple_run(x0, ca, num_steps=20, batch=0, only_alive_cells=False, white
 	run = Video("./_autoplay.mp4", width=320, height=220, html_attributes="autoplay controls", embed=True)
 	return run
 
-def show_batch_run(x_dict, ca, num_steps, only_alive_cells=False, white_background=False):
+def show_batch_run(x_dict, ca, num_steps, only_alive_cells=False, white_background=False, include_y=False, keep_input=False):
 	# Can be too memory heavy...
 	# *4 because of zoom
 
 	x = []
 	key_list = []
+	y = []
+	input_x = []
 	for key, value in x_dict.items():
-		x.append(value)
+		if include_y:
+			cur_x = value[0]
+			y.append(rgba_to_rgb(value[1]))
+		else:
+			cur_x = value
+		x.append(cur_x)
 		key_list.append(key)
+		if keep_input:
+			input_x.append(rgba_to_rgb(cur_x[:,:,:4]))
+
 	x = np.stack(x, axis=0)
+	
+	if include_y:
+		y = np.stack(y, axis=0)
+	if keep_input:
+		input_x = np.stack(input_x, axis=0)
 
 	if only_alive_cells:
-		full_step_array = np.empty([num_steps] + [x.shape[0]] + [x.shape[1] * 4] + [x.shape[2] * 4] + [1])
+		full_step_array = np.empty([num_steps] + list(x.shape[0:3]) + [1])
 	else:
-		full_step_array = np.empty([num_steps] + [x.shape[0]] + [x.shape[1] * 4] + [x.shape[2] * 4] + [3])
+		full_step_array = np.empty([num_steps] + list(x.shape[0:3]) + [3])
 	for i in range(num_steps):
 		if only_alive_cells:
 			if i == 0:
-				res = utils.zoom((x[:, :, :, 3] > 0.1).astype(np.float32), axis_offset=1)
+				res = (x[:, :, :, 3] > 0.1).astype(np.float32)
 			else:
-				res = utils.zoom((x[:, :, :, 3].numpy() > 0.1).astype(np.float32), axis_offset=1)
+				res = (x[:, :, :, 3].numpy() > 0.1).astype(np.float32)
 			full_step_array[i] = res
 		else:
-			res = utils.zoom(rgba_to_rgb(ca.classify(x), white_background=white_background), axis_offset=1)
+			res = rgba_to_rgb(ca.classify(x), white_background=white_background)
 			full_step_array[i] = res
 		x = ca(x)
 
-	for batch_idx in range(full_step_array.shape[1]):
-		with VideoWriter("_autoplay.mp4") as vid:
-			for step_idx in range(full_step_array.shape[0]):
-				vid.add(full_step_array[step_idx, batch_idx])
-		run = Video("./_autoplay.mp4", width=320, height=220, html_attributes="autoplay controls", embed=True)
-		print(key_list[batch_idx])
-		show(run)
+	x = full_step_array
+
+	num_imgs = x.shape[1]
+	if include_y:
+		num_imgs += y.shape[0]
+	if keep_input:
+		num_imgs += input_x.shape[0]
+
+	# fixed width 6
+	width = 6
+	height = np.ceil(num_imgs / width)
+
+	shape = np.array((num_steps, height * cfg.DATA.GRID_SIZE, width * cfg.DATA.GRID_SIZE, 3),dtype=int)
+
+	# zeros so that if its not a grid, fill with black
+	full_vid = np.zeros(shape)
+
+	# Assuming that, otherwise code will not works, thus width 6 hardcoded
+	assert width % 2 == 0 and width % 3 == 0
+
+	step_val = 1 + int(include_y) + int(keep_input)
+	# fill zeros array correctly:
+	for i in range(0, num_imgs, step_val):
+		x_start = (i % width) * cfg.DATA.GRID_SIZE
+		x_end = x_start + cfg.DATA.GRID_SIZE
+		y_start = (i // width) * cfg.DATA.GRID_SIZE
+		y_end = y_start + cfg.DATA.GRID_SIZE
+
+		if keep_input:
+			full_vid[:, y_start: y_end, x_start: x_end, :] = input_x[i//step_val]
+			x_start += cfg.DATA.GRID_SIZE
+			x_end += cfg.DATA.GRID_SIZE
+
+		full_vid[:, y_start: y_end, x_start: x_end, :] = x[:, i//step_val]
+
+		if include_y:
+			x_start += cfg.DATA.GRID_SIZE
+			x_end += cfg.DATA.GRID_SIZE
+			full_vid[:, y_start: y_end, x_start: x_end, :] = y[i//step_val]
+
+	single_img_size = 120
+	with VideoWriter("_autoplay.mp4") as vid:
+		for step_idx in range(num_steps):
+			vid.add(full_vid[step_idx])
+	run = Video("./_autoplay.mp4", width=single_img_size * width,
+	 height=single_img_size * height, html_attributes="autoplay controls", embed=True)
+	# print(key_list[batch_idx])
+	show(run)
 
 
 def clear():
@@ -238,8 +294,35 @@ def plot_min_max_mean(val_dict, title=""):
 	return fig
 
 
+def plot_ganca_loss(loss_dict, title_text=utils.get_cfg_infos(), textwrap_width=120, y_range="auto",
+					return_plot=False):
+	fig = go.Figure()
+
+	d_real = go.Scatter(y=loss_dict["train"]["disc_loss_real"], name="disc_loss_real")
+	d_fake = go.Scatter(y=loss_dict["train"]["disc_loss_fake"], name="disc_loss_fake")
+	ganca = go.Scatter(y=loss_dict["train"]["ganca_loss"], name="ganca_loss")
+	fig.add_trace(d_real)
+	fig.add_trace(d_fake)
+	fig.add_trace(ganca)
+
+	fig.layout.title.text = "<br>".join(textwrap.wrap(title_text, width=textwrap_width))
+	fig.layout.title.font.size = 12
+
+	if type(y_range) in [list, tuple]:
+		fig.update_yaxes(range=y_range)
+	elif y_range == "auto":
+		# automatically find decent y_range
+		means = np.mean(np.stack(list(loss_dict["train"].values()), axis=0), axis=0)
+		max_y = np.median(loss_dict["train"]["ganca_loss"]) * 2
+		fig.update_yaxes(range=(0, 2))
+
+	if return_plot:
+		return fig
+	else:
+		fig.show()
+
 def plot_train_and_val_loss(train_losses, val_loss_dict, smoothing_weight=0.8, y_range=None,
-	title_text=utils.get_cfg_infos(), textwrap_width=120):
+	title_text=utils.get_cfg_infos(), textwrap_width=120, mean_val=True, return_plot=False):
 	""" Standard call during training to plot train and validation in one plot
 	Replaces the plot_losses call
 	train_losses is expected to be an array with shape [1,N] with N number of steps
@@ -259,19 +342,37 @@ def plot_train_and_val_loss(train_losses, val_loss_dict, smoothing_weight=0.8, y
 	step_size = cfg.EXTRA.VAL_LOG_INTERVALL
 
 	# TODO make some visible from the start?
-	for key, value in val_loss_dict.items():
-		x = np.arange(0, len(value) * step_size, step_size)
-		trace = go.Scatter(x=x, y=value, name=key, visible="legendonly")
+	# TODO currently only the mean
+
+	if mean_val:
+		values = list(val_loss_dict.values())
+		values = np.stack(values, axis=0)
+		mean_vals = np.mean(values, axis=0)
+		x = np.arange(0, mean_vals.shape[0] * step_size, step_size)
+		trace = go.Scatter(x=x, y=mean_vals, name="mean_val")
 		fig.add_trace(trace)
+
+	else:
+		for key, value in val_loss_dict.items():
+			x = np.arange(0, len(value) * step_size, step_size)
+			trace = go.Scatter(x=x, y=value, name=key, visible="legendonly")
+			fig.add_trace(trace)
 
 	fig.layout.title.text = "<br>".join(textwrap.wrap(title_text, width=textwrap_width))
 	fig.layout.title.font.size = 12
 	# fig.layout.uniformtext.mode = "show"
 
-	if y_range:
+	if type(y_range) in [list, tuple]:
 		fig.update_yaxes(range=y_range)
+	elif y_range == "auto":
+		# automatically find decent y_range
+		max_y = np.median(train_losses[:,0]) * 2
+		fig.update_yaxes(range=(0,max_y))
 
-	fig.show()
+	if return_plot:
+		return fig
+	else:
+		fig.show()
 
 def plot_losses(loss_logs, log_scale=False, return_plot=False, plot_mean=True,
  smoothing_weight=0.8, title_text=utils.get_cfg_infos(), textwrap_width=120, 

@@ -13,6 +13,8 @@ import numpy as np
 import io
 import time
 
+import copy
+
 # Video and visualization stuff
 import tqdm
 import PIL.Image, PIL.ImageDraw
@@ -76,10 +78,22 @@ def get_auto_title():
 
 def get_cfg_infos():
 	""" creates small ish title str with important informations """
-	full_str = str(cfg.WORLD.__dict__) + str(cfg.DATA.__dict__) + str(cfg.MODEL.__dict__) + \
+	# Hotfix to shorten the DATA dict string with too many targets
+	data_dict = copy.deepcopy(cfg.DATA.__dict__)
+	data_dict["TARGETS"] = "many"
+
+	# Add session id to str if not in extra dict
+	if "SESSION_ID" not in list(cfg.EXTRA.__dict__.keys()):
+		cfg.EXTRA.__dict__["SESSION_ID"] = cfg.EXTRA.SESSION_ID
+
+	full_str = str(cfg.WORLD.__dict__) + str(data_dict) + str(cfg.MODEL.__dict__) + \
 						 str(cfg.TRAIN.__dict__) + str(cfg.EXTRA.__dict__)
+
+	# arbitrary len of str, then too big
+	if "test" not in cfg.settings_name and len(full_str) > 100:
+		return cfg.settings_name + ": " + cfg.EXTRA.SESSION_ID
+
 	return full_str
-	# return full_st
 
 def shape(arr):
 	""" Returns shape of array, len if list"""

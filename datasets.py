@@ -27,11 +27,14 @@ import matplotlib.pyplot as plt
 import json 
 # --- MNIST --- (later as Class maybe)
 
+# Can maybe be outsoucred to utils
+import warnings
+
 
 def get_dataset_class():
 	""" Function to get all data! 
 	Dependent on the config file, dataset and configurations will be chosen here. """
-	if cfg.DATA.NAME == "EMOJI":
+	if "EMOJI" in cfg.DATA.NAME:
 		data_class = EmojiDataset()
 	elif cfg.DATA.NAME == "FACES":
 		data_class = FacesDataset()
@@ -59,18 +62,58 @@ class Dataset():
 		images contains an array of images, e.g. [100, 40, 40, 16]"""
 		pass
 
+	def create_partitions(self, full_size, fill_function, targets):
+		""" creates x partion of size full_size: [set_size, width, height, depth]
+		using the fill function, which accepts a size and returns tha same shape as full_size[1:]"""
+		
+		num_partitions = len(targets)
+		x_partition = np.empty(full_size, dtype=cfg.MODEL.FLOATX)
+		y_partition = np.empty(full_size[:3] + (4,), dtype=cfg.MODEL.FLOATX)
+
+		set_seperator = {}
+
+		size_all = full_size[0] // num_partitions
+		size_extra = full_size[0] % num_partitions
+		cur_idx = 0
+
+		for i in range(num_partitions):
+			# To evenly distribute the extra spaces
+			if size_extra > 0:
+				cur_size = size_all + 1
+				size_extra -= 1
+			else:
+				cur_size = size_all
+
+			# if always the same fill function, just call it here...
+			cur_x, cur_y, emoji_sep = fill_function((cur_size,) + full_size[1:], i, targets)
+
+			if cur_x is None:
+				# If failed to load file, skip step
+				raise NotImplementedError("Not easy to solve as idx will all be messed up")
+
+			set_seperator[targets[i]] = self.get_set_seperator(emoji_sep, cur_idx)
+			x_partition[cur_idx:cur_idx + cur_size] = cur_x
+			y_partition[cur_idx:cur_idx + cur_size] = cur_y
+
+			cur_idx += cur_size
+
+		assert cur_idx == full_size[0], "Not every value in empty has been filled!"
+		assert not np.any(np.abs(x_partition) > 1e10), "A abs value is higher than 1e10, likely not filled!"
+
+		return x_partition, y_partition, set_seperator
+
 	def create_dataset(self):
 		print(f"Creating {self.name} Dataset")
 
-		x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N)
-		num_partitions = len(self.targets)
+		x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE, cfg.MODEL.CHANNEL_N + cfg.WORLD.ENV_SIZE)
+		# num_partitions = len(self.targets)
 
 		train_x, train_y, train_sep = self.create_partitions((cfg.DATA.TRAIN_SIZE,) + x_shape,
-															 self.fill, num_partitions)
+															 self.fill, self.train_targets)
 		val_x, val_y, val_sep = self.create_partitions((cfg.DATA.VAL_SIZE,) + x_shape,
-															 self.fill, num_partitions)
+															 self.fill, self.val_targets)
 		test_x, test_y,test_sep = self.create_partitions((cfg.DATA.TEST_SIZE,) + x_shape,
-															 self.fill, num_partitions)
+															 self.fill, self.test_targets)
 
 		dataset = {
 			"train":
@@ -93,6 +136,26 @@ class Dataset():
 		assert train_x.dtype == np.dtype(cfg.MODEL.FLOATX), "Wrong dtype in train_x"
 
 		return dataset, seperator
+
+	def get_all_img_types(self, data_set, idx_offset=0, random_idx=False, include_y=False):
+		""" Returns dict with imgs for each type of data
+		offset 0 to alwalys get the first, random to get a random in correct range
+		data_set from "train", "val", "test"
+		"""
+
+		img_dict = {}
+		for item_name, item_dict in self.seperator[data_set].items():
+			for key, value in item_dict.items():
+				if random_idx:
+					cur_idx = np.random.randint(value[0], value[1])
+				else:
+					cur_idx = value[0] + idx_offset
+				if include_y:
+					img_dict[item_name + "_" + key] = [self.dataset[data_set]["x"][cur_idx],
+													   self.dataset[data_set]["y"][cur_idx]]
+				else:
+					img_dict[item_name + "_" + key] = self.dataset[data_set]["x"][cur_idx]
+		return img_dict
 		
 
 class EmojiDataset(Dataset):
@@ -100,8 +163,13 @@ class EmojiDataset(Dataset):
 	name = "Emoji"
 
 	def __init__(self):
-		# TODO wow defined here as self, but using the cfg. inforamtion in the class, not good
-		self.targets = self.get_targets()
+		# Decides which emoji dataset will be loaded
+		self.from_file = True if cfg.DATA.NAME == "EMOJI_DATA" else False
+
+		self.train_targets, self.val_targets, self.test_targets = self.get_targets()
+
+		# idx of fonts, not nice here, not sure where else...
+		self.unique_fonts = []
 
 		# TODO targets for train/val seperate 
 		# Defines the boundaries where which type of data is stored
@@ -112,15 +180,23 @@ class EmojiDataset(Dataset):
 		""" if cfg.DATA.TARGETS is a list/tuple, will use this,
 		if its a number will return a number of randomly selected emojis """
 
-		if type(cfg.DATA.TARGETS) in ["list", "tuple"]:
+		if type(cfg.DATA.TARGETS) in [list, tuple]:
 			targets = cfg.DATA.TARGETS
+			return targets, targets, targets
 		elif type(cfg.DATA.TARGETS) == int:
 			idx_list = np.random.choice(range(len(emoji_dict)), size=cfg.DATA.TARGETS, replace=False)
 			emoji_dict_list = list(emoji_dict)
 			targets = tuple([emoji_dict_list[idx] for idx in idx_list])
 			print("Created Target list:", targets)
+			# TODO this just copies 3 targets for train,val and test
+			return targets, targets, targets
+		# TODO dict should be the standard!
+		elif type(cfg.DATA.TARGETS) == dict:
+			tar = cfg.DATA.TARGETS
+			return tar["train"], tar["val"], tar["test"]
+		else:
+			raise ValueError(f"{type(cfg.DATA.TARGETS)}, with unassign function")
 
-		return targets
 
 	def get_set_seperator(self, sep, cur_idx):
 		""" Turn emoji seperator into part of a set seperator """
@@ -129,49 +205,21 @@ class EmojiDataset(Dataset):
 			sep.update({key: [el + cur_idx for el in value]})
 		return sep
 
-
-	def create_partitions(self, full_size, fill_function, num_partitions):
-		""" creates x partion of size full_size: [set_size, width, height, depth]
-		using the fill function, which accepts a size and returns tha same shape as full_size[1:]"""
-		
-		x_partition = np.empty(full_size, dtype=cfg.MODEL.FLOATX)
-		y_partition = np.empty(full_size[:3] + (4,), dtype=cfg.MODEL.FLOATX)
-
-		set_seperator = {}
-
-		size_all = full_size[0] // num_partitions
-		size_extra = full_size[0] % num_partitions
-		cur_idx = 0
-
-		for i in range(num_partitions):
-			# To evenly distribute the extra spaces
-			if size_extra > 0:
-				cur_size = size_all + 1
-				size_extra -= 1
-			else:
-				cur_size = size_all
-
-			# if always the same fill function, just call it here...
-			cur_x, cur_y, emoji_sep = fill_function((cur_size,) + full_size[1:], i)
-
-			set_seperator[self.targets[i]] = self.get_set_seperator(emoji_sep, cur_idx)
-			x_partition[cur_idx:cur_idx + cur_size] = cur_x
-			y_partition[cur_idx:cur_idx + cur_size] = cur_y
-
-			cur_idx += cur_size
-
-		assert cur_idx == full_size[0], "Not every value in empty has been filled!"
-		assert not np.any(np.abs(x_partition) > 1e10), "A abs value is higher than 1e10, likely not filled!"
-
-		return x_partition, y_partition, set_seperator
-
-	def fill(self, size, idx):
+	def fill(self, size, idx, targets):
 		""" main fill function for x, changes how to fill it dependent on the config
 		returns correctly sized x and y """
 
-		emoji_obj = Emoji(self.targets[idx])
+		# TODO from file option hardcoded here...
+		emoji_obj = Emoji(targets[idx], from_file=self.from_file)
 
 		emoji_y = emoji_obj.emoji_img
+
+		# If file has not loaded correctly 
+		if self.from_file and emoji_y is None:
+			# Deletes target from list like it was never there
+			del targets[idx]
+			return None, None, None
+
 		single_y = add_padding(emoji_y, cfg.DATA.GRID_SIZE)[None, :]
 		full_y = np.repeat(single_y, size[0], axis=0)
 
@@ -185,18 +233,31 @@ class EmojiDataset(Dataset):
 			single_x = np.zeros((1,) + size[1:])
 			single_x[:,:,:,:4] = edge_emoji[None, :]
 
+			if cfg.WORLD.ENV_SIZE > 0:
+				single_x[:,:,:,-cfg.WORLD.ENV_SIZE:] = self.fill_env(size, idx, targets)
+
 			full_x = np.repeat(single_x, size[0], axis=0)	
  
 		if cfg.DATA.NOISE > 0:
 
 			# Add gaussian noise to all images
-			noise = np.random.normal(0, cfg.DATA.NOISE, size)
+			if cfg.DATA.BINARY_NOISE:
+				noise = np.random.normal(0, cfg.DATA.NOISE, list(size[:3]) + [1])
+				# TODO hard coded value if noise is added or not here
+				noise = np.array(np.abs(noise) > 0.65, dtype=cfg.MODEL.FLOATX)	
+				noise = np.repeat(noise, 4, axis=3)		
+			else:
+				noise = np.random.normal(0, cfg.DATA.NOISE, size)
 
 			if cfg.DATA.ONLY_POS_NOISE:
 				noise = np.abs(noise)
 
-			# apply noise	
-			full_x = full_x + noise
+			# TODO all channels or just first 4?
+			if cfg.DATA.BINARY_NOISE:
+				full_x[:,:,:,:4] += noise
+			else:
+				# apply noise	
+				full_x = full_x + noise
 
 			if cfg.DATA.CLIP_NOISE:
 				full_x = np.clip(full_x, 0, 1)
@@ -208,6 +269,22 @@ class EmojiDataset(Dataset):
 		cur_seperator = self.get_seperator_per_emoji(size[0], damaged_idx)
 
 		return full_x, full_y, cur_seperator
+
+	def fill_env(self, size, idx, targets):
+		""" returns enviroment information """
+		env = np.zeros((1,) + size[1:3] + (cfg.WORLD.ENV_SIZE,))
+		# TODO pretty hard coded stuff here...
+		font_name = targets[idx].split("/")[2]
+		
+		if font_name not in self.unique_fonts:
+			self.unique_fonts.append(font_name)
+
+		font_idx = self.unique_fonts.index(font_name)
+		# one hot encode font information
+		env[:,:,:,font_idx] = 1
+
+		return env
+
 
 	def get_seperator_per_emoji(self, size, damaged_idx):
 		# Returns the seperator for a single emoji, last idx not inclusive
@@ -273,20 +350,6 @@ class EmojiDataset(Dataset):
 		x[mask] = 0.
 		return x
 
-	def get_all_img_types(self, data_set, idx_offset, random_idx=False):
-		""" Returns dict with imgs for each type of data
-		offset 0 to alwalys get the first, random to get a random in correct range"""
-		img_dict = {}
-		for emoji_name, emoji_dict in self.seperator[data_set].items():
-			for key, value in emoji_dict.items():
-				if random_idx:
-					cur_idx = np.random.randint(value[0], value[1])
-				else:
-					cur_idx = value[0] + idx_offset
-				img_dict[emoji_name + "_" + key] = self.dataset[data_set]["x"][cur_idx]
-		return img_dict
- 
-
 class FacesDataset(Dataset):
 	""" Overwriting Dataset, to add specific Faces functionality to load and prepare this data """
 	# from: https://github.com/bchao1/Anime-Face-Dataset
@@ -294,7 +357,7 @@ class FacesDataset(Dataset):
 	name = "Faces"
 
 	def __init__(self):
-		self.targets = self.get_targets()
+		self.train_targets, self.val_targets, self.test_targets = self.get_targets()
 
 		# Defines the boundaries where which type of data is stored
 		self.seperator = {}
@@ -311,43 +374,9 @@ class FacesDataset(Dataset):
 		all_file_names = os.listdir("faces_dataset/cropped/")
 		idx_list = np.random.choice(range(len(all_file_names)), size=cfg.DATA.TARGETS, replace=False)
 		targets = tuple([all_file_names[i] for i in idx_list])
-		return targets
 
-	def create_partitions(self, full_size, fill_function, num_partitions):
-		# TODO might be identical to the one from emojis
-		""" creates x partion of size full_size: [set_size, width, height, depth]
-		using the fill function, which accepts a size and returns tha same shape as full_size[1:]"""
-		
-		x_partition = np.empty(full_size, dtype=cfg.MODEL.FLOATX)
-		y_partition = np.empty(full_size[:3] + (4,), dtype=cfg.MODEL.FLOATX)
-
-		set_seperator = {}
-
-		size_all = full_size[0] // num_partitions
-		size_extra = full_size[0] % num_partitions
-		cur_idx = 0
-
-		for i in range(num_partitions):
-			# To evenly distribute the extra spaces
-			if size_extra > 0:
-				cur_size = size_all + 1
-				size_extra -= 1
-			else:
-				cur_size = size_all
-
-			# if always the same fill function, just call it here...
-			cur_x, cur_y, emoji_sep = fill_function((cur_size,) + full_size[1:], i)
-
-			set_seperator[self.targets[i]] = self.get_set_seperator(emoji_sep, cur_idx)
-			x_partition[cur_idx:cur_idx + cur_size] = cur_x
-			y_partition[cur_idx:cur_idx + cur_size] = cur_y
-
-			cur_idx += cur_size
-
-		assert cur_idx == full_size[0], "Not every value in empty has been filled!"
-		assert not np.any(np.abs(x_partition) > 1e10), "A abs value is higher than 1e10, likely not filled!"
-
-		return x_partition, y_partition, set_seperator
+		# TODO train,val,test targets
+		return targets, targets, targets
 
 	def get_set_seperator(self, sep, cur_idx):
 		# TOOD is emoji thingy
@@ -373,9 +402,11 @@ class FacesDataset(Dataset):
 		return edges
 
 
-	def fill(self, size, idx):
+	def fill(self, size, idx, targets):
+
 		# TODO not hard coded shape and so on
-		single_y = self.get_face_from_name(self.targets[idx], shape=(64,64))
+		# TODO should not be grid size, but rather target size than add padding
+		single_y = self.get_face_from_name(targets[idx], shape=(cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE))
 		single_y_norm = single_y[None, :].astype(cfg.MODEL.FLOATX) / 255.
 		full_y = np.repeat(single_y_norm, size[0], axis=0)
 
@@ -392,8 +423,6 @@ class FacesDataset(Dataset):
 		# cur_seperator = self.get_seperator()
 
 		return full_x, full_y, cur_seperator
-
-
 
 def to_ten_dim_label(x, y):
 	""" Converts y into 28x28 images with 10 depth for prediction	"""
@@ -479,12 +508,30 @@ class Emoji:
 	
 	raw_img_sizes = [32, 72, 128, 512]
 
-	def __init__(self, emoji_str):
+	def __init__(self, emoji_str, from_file=False):
 		self.emoji_str = emoji_str
-		self.emoji_img = self.get_emoji_img(emoji_str)
+		self.emoji_img = self.get_emoji_img(emoji_str, from_file)
 		# self.emoji_rgb = utils.rgba_to_rgb(self.emoji_img)
 
-	def get_emoji_img(self, emoji_str):
+	def get_emoji_img_from_file(self, emoji_str):
+		try:
+			img = np.array(PIL.Image.open(emoji_str + ".png"))
+		except FileNotFoundError as e:
+			# TODO when file not found, it should be removed from the targets list or so?
+			warnings.warn("Warning, file not found")
+			print(e)
+			# TODO special case when none?
+			return None
+
+		img = cv2.resize(img, (cfg.DATA.TARGET_SIZE,) * 2)
+		img = img.astype(cfg.MODEL.FLOATX)/255.0
+		return img
+
+	def get_emoji_img(self, emoji_str, from_file=False):
+
+		if from_file:
+			return self.get_emoji_img_from_file(emoji_str)
+
 		code = self.get_emoji_char(emoji_str)
 
 		# Select the smallest possible size to load from
@@ -530,6 +577,9 @@ class Emoji:
 			img = self.emoji_img
 
 		edges = get_gray_edge_image(img)
+		if cfg.DATA.BINARY_X:
+			# TODO which value here?
+			edges = np.array(edges > 0.1, dtype=cfg.MODEL.FLOATX)
 		return edges
 
 	def save_to_file(self, path=""):
@@ -547,7 +597,19 @@ def get_gray_edge_image(img):
 	img[:,:,:3] *= img[:,:,3:4]
 	img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 	img = np.uint8(255 * img)
-	edges = cv2.Canny(img,100,200)
+
+	if cfg.DATA.EDGE_DETECTION == "CANNY":
+		edges = cv2.Canny(img,250,500)
+	elif cfg.DATA.EDGE_DETECTION =="THRESHOLD_OTSU":
+		thresh, edges = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+	elif cfg.DATA.EDGE_DETECTION =="ADAPTIVE_GAUSSIAN":
+		# TODO last to variables hyperparameters, quite important, here 15,0 looked good for emojis
+		edges = cv2.adaptiveThreshold(img,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,\
+										cv2.THRESH_BINARY,15,0)
+	else:
+		raise ValueError("Not impelemented for :", cfg.DATA.EDGE_DETECTION)
+
+
 	edges = np.repeat(edges[:,:,None], 4, axis=2)
 	edges = edges.astype(cfg.MODEL.FLOATX) / 255.
 	return edges

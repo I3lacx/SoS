@@ -14,7 +14,140 @@ import numpy as np
 import os
 
 
-class Trainer:
+def get_trainer():
+	if cfg.MODEL.NAME == "GANCA":
+		return GANCATrainer
+	elif cfg.MODEL.NAME == "NCA":
+		return NCATrainer
+	else:
+		raise ValueError(f"Name {cfg.MODEL.NAME} not found/ not implemneted")
+
+class GANCATrainer:
+	"""
+	Trainer for the GANCA model, can possibly use an abstract Trainer class to ebrt von
+	"""
+
+	# TODO last two arguments unused
+	def __init__(self, train_set, val_set, model, vis=None, data_seperator=None):
+		self.train_set = train_set
+		self.val_set = val_set
+		self.g_model = model[1].generator
+		self.d_model = model[0]
+		self.ganca = model[1]
+
+		self.half_batch_size = cfg.TRAIN.BATCH_SIZE // 2
+
+		self.losses = {}
+		self.init_loss_dict()
+
+		self.current_step = 0
+
+		self.init_models()
+
+	def init_models(self):
+		""" initialize models withtheir training hyperparameters """
+		# TODO define somewhere over settings?
+		# d_opt = tf.keras.optimizers.Adam(lr=1e-4, beta_1=0.5)
+		# self.d_model.compile(loss='binary_crossentropy', optimizer=d_opt)
+
+		g_opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.GANCA_LR, beta_1=0.5)
+		self.ganca.compile(loss='binary_crossentropy', optimizer=g_opt)
+
+	def get_train_batch(self):
+		""" get full batch for single training step """
+		ganca_in, ganca_y = self.get_input_samples(self.train_set["x"], cfg.TRAIN.BATCH_SIZE)
+		real_imgs, y_real = self.get_input_samples(self.train_set["y"], self.half_batch_size, noise=cfg.DATA.DISC_INPUT_NOISE)
+		fake_imgs, y_fake = self.get_fake_samples(ganca_in[::2], self.half_batch_size, noise=cfg.DATA.DISC_INPUT_NOISE)
+
+		return [ganca_in, ganca_y], [real_imgs, y_real], [fake_imgs, y_fake]
+
+	def init_loss_dict(self):
+		self.losses["train"] = {}
+		self.losses["train"]["disc_loss_real"] = []
+		self.losses["train"]["disc_loss_fake"] = []
+		self.losses["train"]["ganca_loss"] = []
+
+	def update_train_losses(self, d_loss_real, d_loss_fake, ganca_loss):
+		self.losses["train"]["disc_loss_real"].append(d_loss_real)
+		self.losses["train"]["disc_loss_fake"].append(d_loss_fake)
+		self.losses["train"]["ganca_loss"].append(ganca_loss)
+
+	# TODO remove my step, make both trainers the same
+	# @tf.function
+	def full_train_step(self, my_step):
+		ganca, real, fake = self.get_train_batch()
+		# TODO hardcoded shinenegans
+		if False and self.current_step > 500 and self.current_step < 550:
+			d_loss_real = self.d_model.evaluate(*real, verbose=0)
+			d_loss_fake = self.d_model.evaluate(*fake, verbose=0)
+			ganca_loss = self.ganca.train_on_batch(*ganca)
+		else:
+			# TODO likely need to switch to tf to get the results I want, like model output during training
+			# These are two calls as its suppossed to be better for trainingy
+			d_loss_real = self.d_model.train_on_batch(*real)
+			d_loss_fake = self.d_model.train_on_batch(*fake)
+			ganca_loss = self.ganca.train_on_batch(*ganca)
+
+		# print("istru?", id(self.g_model) == id(self.ganca.generator))
+		self.update_train_losses(d_loss_real, d_loss_fake, ganca_loss)
+		print(f"\r {self.current_step}: disc:(r:{d_loss_real:.2f}, f:{d_loss_fake:.2f}), gan:{ganca_loss:.2f}", end="")
+		self.current_step += 1
+
+		return None, None, None, None, None
+
+	# TODO kwarg is not nice solution..
+	def visualize(self, *kwargs):
+		""" visualizes current trainnig step results """
+		if self.current_step % 50 == 0:
+			disp.clear()
+			disp.plot_ganca_loss(self.losses)
+
+	def get_input_samples(self, data_set, size, noise=False):
+		# TODO not fast, not optimal way of getting samples...
+		random_idxs = np.random.choice(np.arange(data_set.shape[0]), size, replace=False)
+		y_gan = np.ones((size, 1))
+
+		x_sample = data_set[random_idxs]
+		# Normalize between -1/1
+
+		if cfg.DATA.GANCA_NORM_INPUT:
+			x_sample = (x_sample - 0.5)/ 0.5
+
+		if noise:
+			noise = np.random.normal(0, 0.1, x_sample.shape)
+			x_sample = x_sample + noise
+			if cfg.DATA.GANCA_NORM_INPUT:
+				x_sample = np.clip(x_sample, -1, 1)
+			else: 
+				x_sample = np.clip(x_sample, -1, 1)
+
+		return x_sample, y_gan
+
+	def get_fake_samples(self, x_real, size, noise=False):
+		gen_out = self.g_model(x_real)
+
+
+		if noise:
+			noise = np.random.normal(0, 0.1, gen_out.shape)
+			gen_out = gen_out + noise
+			# TODO not sure about this
+			if cfg.DATA.GANCA_NORM_INPUT:
+				gen_out = np.clip(gen_out, -1, 1)
+			else: 
+				gen_out = np.clip(gen_out, -1, 1)
+				
+
+		# Normalize between -1/1
+		# gen_out = gen_out - 0.5 / 0.5
+		y_fake = np.zeros((size, 1))
+		return gen_out, y_fake
+
+	def load_weights(self, model_name, path):
+		if model_name == "ca":
+			# Load weights of the ca model of the generator
+			self.ganca.ca.load_weights(path)
+
+class NCATrainer:
 	""" 
 	Trainer class to handle most of the training stuff, using the ca and the dataset
 	cfg should configure loss function, batch size and model configs.
@@ -291,7 +424,7 @@ class Trainer:
 			# disp.plot_loss(self.grad_log)
 
 			# print(self.val_loss_log)
-			disp.plot_train_and_val_loss(self.loss_log, self.val_loss_log, y_range=(0,400))
+			disp.plot_train_and_val_loss(self.loss_log, self.val_loss_log, y_range="auto")
 			# disp.plot_losses(self.loss_log, y_range=(0,400))
 			# pass
 

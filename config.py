@@ -6,6 +6,9 @@ dictionary for the Classes.
 # TODO not super fun...
 import utils
 
+# Stores pre configured, more complex ish settings
+import settings
+
 class _ConfigModule:
 	""" Template Class, will be used for each class """
 
@@ -41,6 +44,7 @@ class _Dataset(_ConfigModule):
 	NAME = "EMOJI"
 
 	# tuple defining the target emoji(s), possible targets in utils.emoji_dict
+	# Multipurpose target value... with several usecases 
 	TARGETS = ("lizard", "heart")
 
 	# Defining how the seed will look like: [empty, edges, noise]
@@ -50,10 +54,15 @@ class _Dataset(_ConfigModule):
 	NOISE = 0.4			# Variance of the gaussian noise with 0 mean. 0 for no noise
 	# TODO better way of storing?
 	ONLY_POS_NOISE = False
-	CLIP_NOISE = False
+	CLIP_NOISE = True		# set true as default as of 03.03
+	BINARY_NOISE = True 	# set true as default as of 03.03
+	BINARY_X = True 		# set true as default as of 03.03
 
+	EDGE_DETECTION = "CANNY"
 	DAMAGE = 0			# How much of the Dataset will be damaged, 0 for no damage
 
+	DISC_INPUT_NOISE = False
+	GANCA_NORM_INPUT = False
 	# Size of each part of the dataset
 	TRAIN_SIZE = 1000
 	VAL_SIZE = 100		# TODO maybe it makes more sense to set the size as per part
@@ -72,7 +81,7 @@ class _Dataset(_ConfigModule):
 
 	def post_process(self):
 		""" checking for correct configuration of the config file """
-		assert self.NAME in ["EMOJI", "FACES"]
+		assert self.NAME in ["EMOJI", "FACES", "EMOJI_DATA"]
 
 		if self.NAME == "EMOJI":
 			# TODO, post processing does not make sense here, as I will check again in datasets
@@ -83,6 +92,7 @@ class _Dataset(_ConfigModule):
 
 class _Model(_ConfigModule):
 	""" Parameters for the Model configuration """
+	NAME = "NCA"
 	CHANNEL_N = 16
 	HIDDEN_LAYERS = 0
 	HIDDEN_FILTER_SIZE = 128
@@ -95,7 +105,14 @@ class _Model(_ConfigModule):
 	RESET_ACTIVATION = None # possible strings for activation functions: ["clipping", "sigmoid"]
 	RESET_NOISE = 1e-3
 
+	LEAKY_RELU = False
 	FLOATX = 'float32' # or float64, which float based will be used for all operations
+
+	GANCA_LR = 1e-3
+	DISC_LR = 1e-4
+
+	GANCA_TANH = False
+	GANCA_EXTRA_LAYER = False
 
 	# TODO last layer init and gru and bias maybe better options
 	GRU = False
@@ -152,7 +169,7 @@ class _Extra(_ConfigModule):
 	""" Extra configuraiots, not fittign other modules """
 	USE_TIMER = False	# changed on 05.01.2021 as never used
 	LOG_PATH = "logs/maybe/"
-	SESSION_ID = None
+	SESSION_ID = utils.get_session_id()
 	PRINT_LAYER = False
 	LIST_OF_WEIGHT_NAMES = "all" # List containing the string names of weights to plot in tensorboard, 
 		# "all" for every weight
@@ -162,24 +179,34 @@ class _Extra(_ConfigModule):
 	FIXED_SEED = 0	# fixed seed, 0 for no fixed seed
 
 	VAL_LOG_INTERVALL = 50		# How often to update validation loss (everey X steps)
-	
+	# SETTINGS_NAME = settings_name # TODO is there a way?
+
 	def __init__(self, params={}):
 		super().__init__(params)
 
 
 # Calls and creates all config objects, to be called after importing the module
 # Session Id is set here to make it easier to recognize plots as they all have the id now.
+_targets = settings._create_list_of_targets(*settings.target_lists["exp_1_faces"])
 world_dict = dict()
-data_dict  = dict(NAME="EMOJI", TARGETS=50, CLIP_NOISE=True)
-model_dict = dict()
+data_dict  = dict(NOISE=0., NAME="EMOJI_DATA", BINARY_X=True,
+ CLIP_NOISE=True, BINARY_NOISE=True, TARGETS=_targets,
+ EDGE_DETECTION="ADAPTIVE_GAUSSIAN")
+model_dict = dict(NAME="GANCA", LEAKY_RELU=True,
+ CHANNEL_N=16, DISC_LR=1e-5)
 train_dict = dict(BATCH_SIZE=16)
-extra_dict = dict(SESSION_ID=utils.get_session_id())
+extra_dict = dict()
+settings.add_setting("init", world_dict, data_dict, model_dict, train_dict, extra_dict)
 
-WORLD = _World(world_dict)
-DATA  = _Dataset(data_dict)
-MODEL = _Model(model_dict)
-TRAIN = _Training(train_dict)
-EXTRA = _Extra(extra_dict)
+
+# Adds session id to extra dict so it will be visible in plots
+# Initialize Classes with config settings, select dict by names found in settings file
+settings_name = "ganca_testing"
+WORLD = _World(settings.world_settings[settings_name])
+DATA  = _Dataset(settings.data_settings[settings_name])
+MODEL = _Model(settings.model_settings[settings_name])
+TRAIN = _Training(settings.train_settings[settings_name])
+EXTRA = _Extra(settings.extra_settings[settings_name])
 
 # This is used to save and load the classes
 ALL_CONFIG_CLASSES = ["WORLD", "DATA", "MODEL", "TRAIN", "EXTRA"]
