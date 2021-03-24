@@ -30,8 +30,8 @@ def get_model(summary_writer, **kwargs):
 	if cfg.MODEL.NAME == "GANCA":
 		# TODO IMPORTANT THIS HAS TO BE COMPILED BEFORE PASSING!
 		disc = Discriminator()
-		opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.DISC_LR, beta_1=0.5)
-		disc.compile(loss='binary_crossentropy', optimizer=opt)
+		# opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.DISC_LR, beta_1=0.5)
+		# disc.compile(loss='binary_crossentropy', optimizer=opt)
 		# opt = tf.keras.optimizers.Adam(lr=1e-4, beta_1=0.9)
 		# disc.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'])
 
@@ -59,50 +59,95 @@ class GANCAModel(tf.keras.Model):
 		self.input_x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE,
 				cfg.WORLD.ENV_SIZE + cfg.MODEL.CHANNEL_N)
 
+		self.random_generator = tf.random.Generator.from_seed(42)
 		self.disc_model = discriminator
 		self.ca = ca
 		self.generator = self.get_generator()
 		self.model = self.get_ganca()
+		
 
-		self(tf.keras.Input(shape=self.input_x_shape))
+		if cfg.MODEL.LATENT_DIM is not None:
+			self(tf.keras.Input(shape=cfg.MODEL.LATENT_DIM))
+		else:
+			self(tf.keras.Input(shape=self.input_x_shape))
 
+
+	@tf.function
+	def condition(i, x):
+		return i < num_steps_input
 
 	def get_generator(self):
-		input_layer = tf.keras.Input(shape=self.input_x_shape)
 
-		x = input_layer
-		# TODO random amount of hard coded steps..
-		# num_steps = np.random.randint(50,60)
-		num_steps = 40
+		if cfg.MODEL.LATENT_DIM is not None:
+			input_layer = tf.keras.Input(shape=(cfg.MODEL.LATENT_DIM))
+			l1 = tf.keras.layers.Reshape((10,10,1))(input_layer)
+			l1 = tf.keras.layers.Conv2DTranspose(128, (4,4), strides=(2,2), padding='same')(l1)
+			x = tf.keras.layers.Conv2DTranspose(16, (4,4), strides=(2,2), padding='same')(l1)
+			# num_nodes = np.sum(self.input_x_shape)
+			# tf.keras.layers.Dense(100)
+			# tf.keras.layers.Embedding(num_nodes)
+		else:
+			input_layer = tf.keras.Input(shape=self.input_x_shape)
+			x = input_layer
+
+		# num_steps_input = tf.keras.Input(shape=[], batch_size=1, dtype=tf.int32)[0]
+		# print(num_steps_input)
+		# is not random anyways...
+		num_steps = 50
+		# Numpy random number of steps is not random, its a single random fixed value
+		# num_steps = np.random.randint(*cfg.WORLD.CA_STEP_RANGE)
+		# num_steps = tf.random.uniform([1], *cfg.WORLD.CA_STEP_RANGE, dtype=tf.int32).numpy()[0]
+		# num_steps = self.random_generator.uniform([], *cfg.WORLD.CA_STEP_RANGE, dtype=tf.int32)
+		# num_steps = 40
+		# tf.print("the same?", num_steps)
+
+		# i = tf.constant(0)
+		# body = lambda i, x: (i + 1, self.ca(x))
+		# tf.while_loop(self.condition, body, [i,x])
 		for i in range(num_steps):
-			x = self.ca(x)
+		 	x = self.ca(x)
 		out = x
 
-		if cfg.MODEL.GANCA_EXTRA_LAYER:
-			# TODO trained layer here to reduce number of inputs to 4?
-			out = Conv2D(4, 1, activation=None)(out)
-		else:
-			# slice output to remove last layers
-			out = out[:, :, :, :4]
+		if False:
+			# TODO this does not make nay sense when training for persistency
+			if cfg.MODEL.GANCA_EXTRA_LAYER:
+				# TODO trained layer here to reduce number of inputs to 4?
+				out = Conv2D(4, 1, activation=None)(out)
+			else:
+				# slice output to remove last layers
+				out = out[:, :, :, :4]
 
 
-		if cfg.MODEL.GANCA_TANH:
-			out = tf.keras.layers.Activation('tanh')(out)
-			
 		model = tf.keras.models.Model(input_layer, out)
 		return model
 
+	def prepare_output(self, output):
+		# Todo slightly hard coded
+		fake_img = output[:, :, :, :4]
+		if cfg.MODEL.GANCA_TANH:
+			fake_img = tf.keras.layers.Activation('tanh')(fake_img)
+		return fake_img
+
 	def get_ganca(self):
-		self.disc_model.trainable = False
+		# With tf training this is handled in the gradients function
+		# self.disc_model.trainable = False
 
 		ganca_in = self.generator.input
 		# TODO is this ok like this?
-		fake_img = self.generator.output
+		gen_out = self.generator.output
+		fake_img = self.prepare_output(gen_out)
+
+		if cfg.DATA.GANCA_GEN_NOISE:
+			noise = tf.random.normal(shape=tf.shape(fake_img), mean=0.0, 
+					stddev=0.1, dtype=cfg.MODEL.FLOATX)
+			# fake_img = fake_img + noise
+
 		ganca_out = self.disc_model(fake_img)
+		ganca_out = [ganca_out, gen_out]
 
 		model = tf.keras.models.Model(ganca_in, ganca_out)
-		# opt = tf.keras.optimizers.Adam(lr=0.0002, beta_1=0.5)
-		# model.compile(loss='binary_crossentropy', optimizer=opt)
+		opt = tf.keras.optimizers.Adam(lr=0.0002, beta_1=0.5)
+		model.compile(loss='binary_crossentropy', optimizer=opt)
 		return model
 
 	def call(self, x):
@@ -136,6 +181,10 @@ class Discriminator(tf.keras.Model):
 		out_layer = tf.keras.layers.Dense(1, activation='sigmoid')(layer)
 
 		model = tf.keras.models.Model(in_image, out_layer)
+
+		# TODO this is a fix to 
+		opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.DISC_LR, beta_1=0.5)
+		model.compile(loss='binary_crossentropy', optimizer=opt)
 		return model
 
 	# @tf.function
