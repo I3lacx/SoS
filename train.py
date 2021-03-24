@@ -37,12 +37,37 @@ class GANCATrainer:
 
 		self.half_batch_size = cfg.TRAIN.BATCH_SIZE // 2
 
+		self.loss_fct = tf.keras.losses.BinaryCrossentropy(label_smoothing=cfg.TRAIN.LABEL_SMOOTHING)
+		# self.l2_loss = tf.keras.losses.MeanSquaredError(tf.keras.losses.Reduction.SUM)
+		self.l2_loss = self.batch_l2_loss
+		self.disc_optimizer = tf.keras.optimizers.Adam(lr=cfg.MODEL.DISC_LR, beta_1=0.5)
+		self.ganca_optimizer = tf.keras.optimizers.Adam(lr=cfg.MODEL.GANCA_LR, beta_1=0.5)
+		self.gen_optimizer = tf.keras.optimizers.Adam(lr=cfg.MODEL.GEN_L2_LR)
 		self.losses = {}
 		self.init_loss_dict()
-
+		self.x_old = None
 		self.current_step = 0
 
+		self.apply_grad_disc = self.get_apply_grad_fn()
+		self.apply_grad_ganca = self.get_apply_grad_fn()
+		self.apply_grad_gen = self.get_apply_grad_fn()
 		self.init_models()
+
+	def individual_l2_loss(self, x, y):
+		""" Creates loss, fitting to task """
+		
+		t = y - x
+
+		if cfg.TRAIN.REGULARIZER:
+			reg = self.regularizer(x[:,:,:,4:])
+			return tf.reduce_sum(t**2, [1, 2, 3]) / 2 + reg
+		else:
+			return tf.reduce_sum(t**2, [1, 2, 3]) / 2
+
+	# @tf.function
+	def batch_l2_loss(self, y, x):
+		return tf.reduce_mean(self.individual_l2_loss(x, y))
+
 
 	def init_models(self):
 		""" initialize models withtheir training hyperparameters """
@@ -50,72 +75,90 @@ class GANCATrainer:
 		# d_opt = tf.keras.optimizers.Adam(lr=1e-4, beta_1=0.5)
 		# self.d_model.compile(loss='binary_crossentropy', optimizer=d_opt)
 
-		g_opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.GANCA_LR, beta_1=0.5)
-		self.ganca.compile(loss='binary_crossentropy', optimizer=g_opt)
+		# g_opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.GANCA_LR, beta_1=0.5)
+		# self.ganca.compile(loss='binary_crossentropy', optimizer=g_opt)
+		pass
 
 	def get_train_batch(self):
 		""" get full batch for single training step """
-		ganca_in, ganca_y = self.get_input_samples(self.train_set["x"], cfg.TRAIN.BATCH_SIZE)
-		real_imgs, y_real = self.get_input_samples(self.train_set["y"], self.half_batch_size, noise=cfg.DATA.DISC_INPUT_NOISE)
-		fake_imgs, y_fake = self.get_fake_samples(ganca_in[::2], self.half_batch_size, noise=cfg.DATA.DISC_INPUT_NOISE)
+		ganca_in, ganca_y = self.get_input_samples(self.train_set["x"], cfg.TRAIN.BATCH_SIZE, use_old=cfg.TRAIN.GANCA_USE_OLD)
+		real_imgs, y_real = self.get_real_samples(self.train_set["y"], self.half_batch_size, noise=cfg.DATA.DISC_INPUT_NOISE)
+		fake_imgs, y_fake = self.get_fake_samples(ganca_in, self.half_batch_size, noise=cfg.DATA.DISC_INPUT_NOISE)
+		gen_x, gen_y = self.get_gen_samples(cfg.TRAIN.BATCH_SIZE)
 
-		return [ganca_in, ganca_y], [real_imgs, y_real], [fake_imgs, y_fake]
+		return [ganca_in, ganca_y], [real_imgs, y_real], [fake_imgs, y_fake], [gen_x, gen_y]
 
 	def init_loss_dict(self):
 		self.losses["train"] = {}
 		self.losses["train"]["disc_loss_real"] = []
 		self.losses["train"]["disc_loss_fake"] = []
 		self.losses["train"]["ganca_loss"] = []
+		self.losses["train"]["gen_l2_loss"] = []
 
-	def update_train_losses(self, d_loss_real, d_loss_fake, ganca_loss):
+	def update_train_losses(self, d_loss_real, d_loss_fake, ganca_loss, gen_loss):
 		self.losses["train"]["disc_loss_real"].append(d_loss_real)
 		self.losses["train"]["disc_loss_fake"].append(d_loss_fake)
 		self.losses["train"]["ganca_loss"].append(ganca_loss)
+		self.losses["train"]["gen_l2_loss"].append(gen_loss)
 
 	# TODO remove my step, make both trainers the same
 	# @tf.function
 	def full_train_step(self, my_step):
-		ganca, real, fake = self.get_train_batch()
+		ganca, real, fake, gen = self.get_train_batch()
 		# TODO hardcoded shinenegans
-		if False and self.current_step > 500 and self.current_step < 550:
-			d_loss_real = self.d_model.evaluate(*real, verbose=0)
-			d_loss_fake = self.d_model.evaluate(*fake, verbose=0)
-			ganca_loss = self.ganca.train_on_batch(*ganca)
+		if False:
+			pass
 		else:
-			# TODO likely need to switch to tf to get the results I want, like model output during training
-			# These are two calls as its suppossed to be better for trainingy
-			d_loss_real = self.d_model.train_on_batch(*real)
-			d_loss_fake = self.d_model.train_on_batch(*fake)
-			ganca_loss = self.ganca.train_on_batch(*ganca)
+			_, d_loss_real, disc_grads  = self.apply_grad_disc(self.d_model, *real, self.disc_optimizer)
+			_, d_loss_fake, _  = self.apply_grad_disc(self.d_model, *fake, self.disc_optimizer)
+			x_old, ganca_loss, _  = self.apply_grad_ganca(self.ganca, *ganca, self.ganca_optimizer, return_x=True)
+			if cfg.TRAIN.GEN_L2_LOSS:
+				_, gen_l2_loss, _ = self.apply_grad_gen(self.ganca.generator, *gen, self.gen_optimizer, l2_loss=True)
+			else:
+				gen_l2_loss = 0
+			self.x_old = x_old
 
-		# print("istru?", id(self.g_model) == id(self.ganca.generator))
-		self.update_train_losses(d_loss_real, d_loss_fake, ganca_loss)
-		print(f"\r {self.current_step}: disc:(r:{d_loss_real:.2f}, f:{d_loss_fake:.2f}), gan:{ganca_loss:.2f}", end="")
+		self.update_train_losses(d_loss_real, d_loss_fake, ganca_loss, gen_l2_loss)
+		losses = [ganca_loss, d_loss_real, d_loss_fake, gen_l2_loss]
+		print(f"\r {self.current_step}: disc:(r:{d_loss_real:.2f}, f:{d_loss_fake:.2f}), gan:{ganca_loss:.2f}, gen_l2:{gen_l2_loss:.2f}", end="")
 		self.current_step += 1
 
-		return None, None, None, None, None
+		return ganca[0], x_old, losses, None, None
 
 	# TODO kwarg is not nice solution..
-	def visualize(self, *kwargs):
+	def visualize(self, x0, x, losses, *kwargs):
 		""" visualizes current trainnig step results """
 		if self.current_step % 50 == 0:
 			disp.clear()
+			# disp.visualize_batch(self.ganca.ca, x0, x, self.current_step, white_background=False)
 			disp.plot_ganca_loss(self.losses)
 
-	def get_input_samples(self, data_set, size, noise=False):
-		# TODO not fast, not optimal way of getting samples...
+	def add_noise(self, x0):
+		noise = tf.random.normal(shape=x0.shape, mean=0, stddev=0.1, dtype=cfg.MODEL.FLOATX)
+		x0 = x0 + noise
+		return x0
+
+	def get_gen_samples(self, size):
+		""" Generator sample supervised training with l2 loss"""
+		data_set_size = self.train_set["x"].shape[0]
+		random_idxs = np.random.choice(np.arange(data_set_size), size, replace=False)
+
+		x = self.train_set["x"][random_idxs]
+		y = self.train_set["y"][random_idxs]
+
+		return x, y
+
+	def get_real_samples(self, data_set, size, noise=False):
 		random_idxs = np.random.choice(np.arange(data_set.shape[0]), size, replace=False)
-		y_gan = np.ones((size, 1))
+		y_gan = np.ones((size, 1), dtype=cfg.MODEL.FLOATX)
 
 		x_sample = data_set[random_idxs]
-		# Normalize between -1/1
 
 		if cfg.DATA.GANCA_NORM_INPUT:
 			x_sample = (x_sample - 0.5)/ 0.5
 
 		if noise:
-			noise = np.random.normal(0, 0.1, x_sample.shape)
-			x_sample = x_sample + noise
+			x_sample = self.add_noise(x_sample)
 			if cfg.DATA.GANCA_NORM_INPUT:
 				x_sample = np.clip(x_sample, -1, 1)
 			else: 
@@ -123,29 +166,128 @@ class GANCATrainer:
 
 		return x_sample, y_gan
 
-	def get_fake_samples(self, x_real, size, noise=False):
-		gen_out = self.g_model(x_real)
+	def get_input_samples(self, data_set, size, noise=False, use_old=False):
+		# TODO not fast, not optimal way of getting samples...
+		# Use old reuses part of saved results for persistency loss
 
+		if cfg.MODEL.LATENT_DIM is not None:
+			x0 = tf.random.normal(shape=(size, cfg.MODEL.LATENT_DIM))
+			y_gan = np.ones((size, 1), dtype=cfg.MODEL.FLOATX)
+			return x0, y_gan
+
+		num_replaced_images = size
+
+		if use_old and self.x_old is not None:
+			idx_mask = np.random.choice([True, False], size=cfg.TRAIN.BATCH_SIZE, 
+					p=[cfg.TRAIN.KEEP_OUTPUT, 1 - cfg.TRAIN.KEEP_OUTPUT])
+			not_idx_mask = np.logical_not(idx_mask)
+			num_replaced_images = sum(not_idx_mask)
+			# rand_batch_idx = np.random.choice(data_set.shape[0], num_replaced_images, replace=False)
+
+		random_idxs = np.random.choice(np.arange(data_set.shape[0]), num_replaced_images, replace=False)
+		y_gan = np.ones((size, 1), dtype=cfg.MODEL.FLOATX)
+
+		x_sample = np.copy(data_set[random_idxs])
+		# Normalize between -1/1
+
+		if use_old and self.x_old is not None:
+			# x0 = np.zeros((cfg.TRAIN.BATCH_SIZE, ) + self.ganca.input_x_shape, dtype=cfg.MODEL.FLOATX)
+			x0 = np.array(self.x_old)
+			x0[not_idx_mask] = x_sample
+		else:
+			x0 = x_sample
+
+		if cfg.DATA.GANCA_NORM_INPUT:
+			x0 = (x0 - 0.5)/ 0.5
 
 		if noise:
-			noise = np.random.normal(0, 0.1, gen_out.shape)
-			gen_out = gen_out + noise
+			x0 = self.add_noise(x0)
+			if cfg.DATA.GANCA_NORM_INPUT:
+				x0 = np.clip(x0, -1, 1)
+			else: 
+				x0 = np.clip(x0, -1, 1)
+
+		return x0, y_gan
+
+	def get_fake_samples(self, ganca_in, size, noise=False, validation=False):
+		# TODO this is not super nice, but would need to get rid of keras if not like this likely
+
+		gen_out = self.g_model(ganca_in)
+		
+		fake_img = self.ganca.prepare_output(gen_out)
+
+		if not validation:
+			# self.x_old = np.array(fake_img, dtype=cfg.MODEL.FLOATX)
+			# Half size to fit for half batch size, not computationaly optimal..
+			fake_img = fake_img[::2]
+
+		if noise:
+			fake_img = self.add_noise(fake_img)
 			# TODO not sure about this
 			if cfg.DATA.GANCA_NORM_INPUT:
-				gen_out = np.clip(gen_out, -1, 1)
+				fake_img = np.clip(fake_img, -1, 1)
 			else: 
-				gen_out = np.clip(gen_out, -1, 1)
-				
+				fake_img = np.clip(fake_img, -1, 1)
 
 		# Normalize between -1/1
 		# gen_out = gen_out - 0.5 / 0.5
-		y_fake = np.zeros((size, 1))
-		return gen_out, y_fake
+		y_fake = np.zeros((size, 1), dtype=cfg.MODEL.FLOATX)
+		return fake_img, y_fake
 
 	def load_weights(self, model_name, path):
 		if model_name == "ca":
 			# Load weights of the ca model of the generator
 			self.ganca.ca.load_weights(path)
+
+	def save_weights(self, path="", name="ca"):
+		if path == "":
+			path = utils.get_full_log_path()
+
+		utils.ensure_dir(path)
+
+		if not os.path.exists(path + name + ".index"):
+			self.ganca.ca.save_weights(path + name)
+		else:
+			raise ValueError(f"Failed to save because path: {path+name} already exists")
+
+
+	def get_apply_grad_fn(self):
+		""" Wrapper for apply grad, needed to run several times without resetting 
+		This is the ganca version!"""
+
+		@tf.function
+		def apply_grad(model, x, y, optimizer, return_x=False, l2_loss=False):
+			with tf.GradientTape() as g:
+				if return_x:
+					# Used for ganca model to include fake image in output
+					out, fake_img = model(x)
+				else:
+					out = model(x)
+					fake_img = None
+
+				if l2_loss:
+					# TODO this cut should be in the output of the gen? But brings other problems..
+					loss = self.l2_loss(y, out[:,:,:,:4])
+				else:
+					loss = self.loss_fct(y, out)
+
+			if return_x:
+				# at this point just a way of saying it is the ganca model
+				grads = g.gradient(loss, model.generator.trainable_variables)
+				if cfg.TRAIN.GANCA_LAYER_NORM:
+					grads = [g/(tf.norm(g)+1e-8) for g in grads]
+				optimizer.apply_gradients(zip(grads, model.generator.trainable_variables))
+			elif l2_loss:
+				grads = g.gradient(loss, model.trainable_variables)
+				if cfg.TRAIN.GANCA_LAYER_NORM:
+					grads = [g/(tf.norm(g)+1e-8) for g in grads]
+				optimizer.apply_gradients(zip(grads, model.trainable_variables))
+			else:
+				grads = g.gradient(loss, model.trainable_variables)
+				optimizer.apply_gradients(zip(grads, model.trainable_variables))
+			return fake_img, loss, grads
+		return apply_grad
+
 
 class NCATrainer:
 	""" 
@@ -518,6 +660,8 @@ class NCATrainer:
 
 		if cfg.TRAIN.KEEP_OUTPUT: 
 			# save old x value
+			# TODO this saves old x values including hidden information
+			# Why?
 			self.x_old = np.array(x)
 			self.y_old = y0
 		elif cfg.TRAIN.USE_PATTERN_POOL:
