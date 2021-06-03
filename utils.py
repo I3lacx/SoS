@@ -43,6 +43,20 @@ grid_plots_simple_nov = {
 	"2020_11_13/14_01_34": [4,4]
 }
 
+
+# TODO this function could be in an superclass for both trainers...
+def save_model_and_plot(trainer, path, name=""):
+
+	# Save current model
+	trainer.save_weights(path=path, name=name + "_model")
+
+	# Save full loss plot
+	plot = trainer.plot_losses()
+
+	save_fig(plot, name=name + "_fig", as_img=True, path=path)
+	save_cfg(path=path, name=name + "_")
+
+	
 def background_options():
 	""" tf and np configs to be run in the background"""
 	tf.keras.backend.set_floatx(cfg.MODEL.FLOATX)
@@ -340,7 +354,7 @@ def get_full_log_path():
 
 	return cur_path
 
-def save_cfg(path=None):
+def save_cfg(path=None, name=""):
 	""" 
 	Saves all config objects in bytes and all changed information as jsons
 	At LOG_PATH + date + time
@@ -350,21 +364,22 @@ def save_cfg(path=None):
 		path = get_full_log_path()
 
 	# Open and write into 'json' (not 100% json)
-	with open(path + "diff.json", "w") as f:
+	with open(path + name + "diff.json", "w") as f:
 		for config_name in cfg.ALL_CONFIG_CLASSES:
 			f.write(f'{{"{config_name}":')
 			json.dump(getattr(cfg, config_name).__dict__, f)
 			f.write("}\n")
 
 	# Open and write into pickle file
-	with open(path + "full_config.pkl", "wb") as f:
+	with open(path + name + "full_config.pkl", "wb") as f:
 		for config_name in cfg.ALL_CONFIG_CLASSES:
 			pickle.dump(getattr(cfg, config_name), f)
 
 	print("Successfully saved configs at: ", path)
 
 
-def save_fig(fig, name="fig", as_json=True, as_img=False, path=None):
+# Todo this could be done as given a list of types like ["json", "svg"]
+def save_fig(fig, name="fig", as_json=True, as_img=False, as_pdf=False, path=None):
 
 	if path is None:
 		path = cfg.EXTRA.LOG_PATH + cfg.EXTRA.SESSION_ID + "/"
@@ -379,18 +394,59 @@ def save_fig(fig, name="fig", as_json=True, as_img=False, path=None):
 		except ValueError:
 			print("VALUE ERROR while writing the png")
 
+	if as_pdf:
+		full_path = path + name + ".pdf"
+		try:
+			fig.write_image(full_path)
+		except ValueError:
+			print("VALUE ERROR while writing the png")
+
+
+
 	print("Successfully saved figure at: ", full_path)
 
 
 def get_all_figs(sess_id, name="fig_"):
-  path = cfg.EXTRA.LOG_PATH + "/" + sess_id + "/"
-  
-  all_files = os.listdir(path)
-  file_names = [file for file in all_files if name in file and "json" in file]
-  
-  figs = []
-  for file_name in file_names:
-    figs.append(read_json(path + file_name))
-    
-  return figs
+	path = cfg.EXTRA.LOG_PATH + "/" + sess_id + "/"
 
+	all_files = os.listdir(path)
+	file_names = [file for file in all_files if name in file and "json" in file]
+
+	figs = []
+	for file_name in file_names:
+		figs.append(read_json(path + file_name))
+
+	return figs
+
+def get_all_figs_by_path(path, name="fig"):
+	all_files = os.listdir(path)
+	file_names = [file for file in all_files if name in file and "json" in file]
+
+	figs = []
+	for file_name in file_names:
+		figs.append(read_json(path + file_name))
+	return figs
+
+def open_cfg_from_path(path, name="full_config.pkl"):
+  """ Open cfg.pkl file from path returns 4 dicts"""
+  out_arr = []
+  with open(path + name, "rb") as f:
+    while 1:
+      try:
+        data = pickle.load(f)
+        
+        out_arr.append(object_to_dict(data))
+      except (EOFError, pickle.UnpicklingError):
+        break
+        
+  return out_arr
+  
+def object_to_dict(obj):
+  """ Turns object into dictionary"""
+  res = {}
+  for attr in dir(obj):
+    if "__" in attr:
+      continue
+    else:
+      res[attr] = getattr(obj, attr)
+  return res

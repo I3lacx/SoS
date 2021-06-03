@@ -18,6 +18,8 @@ import tqdm
 import json
 from google.protobuf.json_format import MessageToDict
 from tensorflow.python.framework import convert_to_constants
+
+from rational.keras import Rational
 # import matplotlib.pyplot as plt
 # from visdom import Visdom
 
@@ -40,8 +42,9 @@ def get_model(summary_writer, **kwargs):
 		else:
 			ca = CAModel(summary_writer=summary_writer)
 
-		ganca = GANCAModel(disc, ca)
-		return disc, ganca
+		gen = Generator(ca)
+		ganca = GANCAModel(disc, gen)
+		return ganca
 		# opt = tf.keras.optimizers.Adam(lr=cfg.TRAIN.LR, beta_1=0.9)
 		# ganca.compile(loss='binary_crossentropy', optimizer=opt)
 	elif cfg.MODEL.NAME == "NCA":
@@ -51,32 +54,108 @@ def get_model(summary_writer, **kwargs):
 		raise ValueError(f"Name {cfg.MODEL.NAME} not found/ not implemneted")
 
 
+class Generator(tf.keras.Model):
+	""" Generator with callable number of steps for ca.. """
+
+	def __init__(self, ca):
+		super().__init__()
+		self.input_x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE,
+				cfg.WORLD.ENV_SIZE + cfg.MODEL.CHANNEL_N)
+		self.ca = ca
+		self.prep_input = self.prepare_input_model()
+
+		if cfg.MODEL.LATENT_DIM is not None:
+			self(tf.keras.Input(shape=cfg.MODEL.LATENT_DIM), 1)
+		else:
+			self(tf.keras.Input(shape=self.input_x_shape), 1)
+
+	def prepare_input_model(self):
+		if cfg.MODEL.LATENT_DIM is not None:
+			input_layer = tf.keras.Input(shape=(cfg.MODEL.LATENT_DIM))
+			l1 = tf.keras.layers.Reshape((10,10,1))(input_layer)
+			# This way the model can not train anything and just transforms the input latent space to an image size
+			l1 = tf.image.resize(l1, (40,40))
+			# print(l1)
+			x = tf.repeat(l1, 16, axis=-1)
+
+			# l1 = tf.keras.layers.Conv2DTranspose(128, (4,4), strides=(2,2), padding='same')(l1)
+			# l1 = tf.keras.layers.LeakyReLU(alpha=0.2)(l1)
+			# l1 = tf.keras.layers.Conv2DTranspose(16, (4,4), strides=(2,2), padding='same')(l1)
+			# x = tf.keras.layers.LeakyReLU(alpha=0.2)(l1)
+			# num_nodes = np.sum(self.input_x_shape)
+			# tf.keras.layers.Dense(100)
+			# tf.keras.layers.Embedding(num_nodes)
+		else:
+			input_layer = tf.keras.Input(shape=self.input_x_shape)
+			x = input_layer
+
+		return tf.keras.models.Model(input_layer, x)
+
+	def prepare_output(self, output):
+		# Todo slightly hard coded
+		fake_img = output[:, :, :, :4]
+		if cfg.MODEL.GANCA_TANH:
+			fake_img = tf.keras.layers.Activation('tanh')(fake_img)
+		return fake_img
+
+	def call(self, x, num_steps):
+		x = self.prep_input(x)
+
+		# Its working! tf.Variable ftw
+		# tf.print("num steps:", num_steps)
+		for _ in tf.range(num_steps):
+			x = self.ca(x)
+
+		gen_out = x
+		fake_img = self.prepare_output(x)
+		return [fake_img, gen_out]
+		
+
+
 class GANCAModel(tf.keras.Model):
 	""" GAN architecture combined with NCA architecture """
 
-	def __init__(self, discriminator, ca):
+	def __init__(self, discriminator, generator):
 		super().__init__()
 		self.input_x_shape = (cfg.DATA.GRID_SIZE, cfg.DATA.GRID_SIZE,
 				cfg.WORLD.ENV_SIZE + cfg.MODEL.CHANNEL_N)
 
-		self.random_generator = tf.random.Generator.from_seed(42)
+		# self.random_generator = tf.random.Generator.from_seed(42)
 		self.disc_model = discriminator
-		self.ca = ca
-		self.generator = self.get_generator()
-		self.model = self.get_ganca()
+		self.generator = generator
+		# self.generator = self.get_generator()
+		# self.model = self.get_ganca()
 		
+		# self.prep_input = self.prepare_input_model()
 
 		if cfg.MODEL.LATENT_DIM is not None:
-			self(tf.keras.Input(shape=cfg.MODEL.LATENT_DIM))
+			self(tf.keras.Input(shape=cfg.MODEL.LATENT_DIM), 1)
 		else:
-			self(tf.keras.Input(shape=self.input_x_shape))
+			self(tf.keras.Input(shape=self.input_x_shape), 1)
 
 
 	@tf.function
 	def condition(i, x):
 		return i < num_steps_input
 
+	def prepare_input_model(self):
+		if cfg.MODEL.LATENT_DIM is not None:
+			input_layer = tf.keras.Input(shape=(cfg.MODEL.LATENT_DIM))
+			l1 = tf.keras.layers.Reshape((10,10,1))(input_layer)
+			l1 = tf.keras.layers.Conv2DTranspose(128, (4,4), strides=(2,2), padding='same')(l1)
+			x = tf.keras.layers.Conv2DTranspose(16, (4,4), strides=(2,2), padding='same')(l1)
+			# num_nodes = np.sum(self.input_x_shape)
+			# tf.keras.layers.Dense(100)
+			# tf.keras.layers.Embedding(num_nodes)
+		else:
+			input_layer = tf.keras.Input(shape=self.input_x_shape)
+			x = input_layer
+
+		return tf.keras.models.Model(input_layer, x)
+
 	def get_generator(self):
+		# rewritten such that generator is not existing..
+		raise NotImplementedError()
 
 		if cfg.MODEL.LATENT_DIM is not None:
 			input_layer = tf.keras.Input(shape=(cfg.MODEL.LATENT_DIM))
@@ -121,13 +200,6 @@ class GANCAModel(tf.keras.Model):
 		model = tf.keras.models.Model(input_layer, out)
 		return model
 
-	def prepare_output(self, output):
-		# Todo slightly hard coded
-		fake_img = output[:, :, :, :4]
-		if cfg.MODEL.GANCA_TANH:
-			fake_img = tf.keras.layers.Activation('tanh')(fake_img)
-		return fake_img
-
 	def get_ganca(self):
 		# With tf training this is handled in the gradients function
 		# self.disc_model.trainable = False
@@ -146,12 +218,18 @@ class GANCAModel(tf.keras.Model):
 		ganca_out = [ganca_out, gen_out]
 
 		model = tf.keras.models.Model(ganca_in, ganca_out)
-		opt = tf.keras.optimizers.Adam(lr=0.0002, beta_1=0.5)
-		model.compile(loss='binary_crossentropy', optimizer=opt)
+		# opt = tf.keras.optimizers.Adam(lr=0.0002, beta_1=0.5)
+		# model.compile(loss='binary_crossentropy', optimizer=opt)
 		return model
 
-	def call(self, x):
-		return self.model(x)
+	def call(self, x, num_steps):
+
+		# These two could be outsourced as an additional keras model
+		fake_img, gen_out = self.generator(x, num_steps)
+
+		ganca_out = self.disc_model(fake_img)
+		ganca_out = [ganca_out, gen_out]
+		return ganca_out
 
 class Discriminator(tf.keras.Model):
 	""" simple discriminator architecter for GANCA training """
@@ -169,22 +247,40 @@ class Discriminator(tf.keras.Model):
 
 	def get_model(self):
 		in_image = tf.keras.Input(shape=self.input_x_shape)
-		layer = tf.keras.layers.Conv2D(128, (3,3), strides=(2,2), padding='same')(in_image)
+
+		if cfg.TRAIN.GANCA_LOSS_TYPE == "WGAN":
+			constr = lambda x: tf.clip_by_value(x, -cfg.TRAIN.WGAN_CRITIC_CLIP, cfg.TRAIN.WGAN_CRITIC_CLIP)
+		else:
+			constr = None
+
+		layer = tf.keras.layers.Conv2D(128, (3,3), strides=(2,2), padding='same',
+			kernel_constraint=constr)(in_image)
 		layer = tf.keras.layers.LeakyReLU(alpha=0.2)(layer)
 
-		layer = tf.keras.layers.Conv2D(128, (3,3), strides=(2,2), padding='same')(in_image)
-		layer = tf.keras.layers.LeakyReLU(alpha=0.2)(layer)
+		# BIG FIX, WAS NOT USING THE FIRST LAYER BEFORE! CHANGE AT 21.04!!!
+		if cfg.MODEL.BUGGED_DISC:
+			layer = tf.keras.layers.Conv2D(cfg.MODEL.DISC_SIZE, (3,3), strides=(2,2), 
+				padding='same', kernel_constraint=constr)(in_image)
+			layer = tf.keras.layers.LeakyReLU(alpha=0.2)(layer)
+		else:
+			layer = tf.keras.layers.Conv2D(cfg.MODEL.DISC_SIZE, (3,3), strides=(2,2), 
+				padding='same', kernel_constraint=constr)(layer)
+			layer = tf.keras.layers.LeakyReLU(alpha=0.2)(layer)
+
 
 		layer = tf.keras.layers.Flatten()(layer)
 		layer = tf.keras.layers.Dropout(0.4)(layer)
 
-		out_layer = tf.keras.layers.Dense(1, activation='sigmoid')(layer)
+		if cfg.MODEL.TRAIN_DISC:
+			# TODO hardcoded 50 here, to train for classification
+			out_layer = tf.keras.layers.Dense(50, activation='softmax')(layer)
+		else:
+			if cfg.TRAIN.GANCA_LOSS_TYPE == "WGAN":
+				out_layer = tf.keras.layers.Dense(1, activation=None, kernel_constraint=constr)(layer)
+			else:
+				out_layer = tf.keras.layers.Dense(1, activation='sigmoid', kernel_constraint=constr)(layer)
 
 		model = tf.keras.models.Model(in_image, out_layer)
-
-		# TODO this is a fix to 
-		opt = tf.keras.optimizers.Adam(lr=cfg.MODEL.DISC_LR, beta_1=0.5)
-		model.compile(loss='binary_crossentropy', optimizer=opt)
 		return model
 
 	# @tf.function
@@ -206,6 +302,8 @@ class CAModel(tf.keras.Model):
 		self.add_noise = add_noise
 		self.env_size = env_size
 
+		# saving the activation functions to acces them later (for rationals)
+		self.activations = []
 		# summary writer in the model used to log weights histogram during training
 		self.summary_writer = summary_writer
 
@@ -245,33 +343,45 @@ class CAModel(tf.keras.Model):
 		#   input_layer[:, cfg.DATA.GRID_SIZE//2, cfg.DATA.GRID_SIZE//2, 3:] = 1.
 
 
-
-		if cfg.MODEL.LEAKY_RELU:
-			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=None,
-									padding="SAME", name="perceive")(input_layer)
-			current_layer = tf.keras.layers.LeakyReLU()(current_layer)
+		if cfg.MODEL.NCA_ACTIVATION == "RELU":
+			activation = tf.keras.layers.ReLU()
+		elif cfg.MODEL.NCA_ACTIVATION == "LEAKY_RELU":
+			activation = tf.keras.layers.LeakyReLU()
+		elif cfg.MODEL.NCA_ACTIVATION == "RATIONAL":
+			activation = Rational(approx_func='relu')
+			self.activations.append(activation)
 		else:
-			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=tf.nn.relu,
-								padding="SAME", name="perceive")(input_layer)
+			raise ValueError(f"{cfg.MODEL.NCA_ACTIVATION=}")
 
+		current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 3, activation=activation,
+								padding="SAME", name="perceive")(input_layer)
 
 		if cfg.EXTRA.LOG_LAYERS:
 			output_layers = [("input_layer", input_layer), ("perceive", current_layer)]
 
 		previous_layer = current_layer
 		for i in range(cfg.MODEL.HIDDEN_LAYERS):
-			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 1, activation=None)(previous_layer)
+
+			if cfg.MODEL.NCA_ACTIVATION == "RELU":
+				activation = tf.keras.layers.ReLU()
+			elif cfg.MODEL.NCA_ACTIVATION == "LEAKY_RELU":
+				activation = tf.keras.layers.LeakyReLU()
+			elif cfg.MODEL.NCA_ACTIVATION == "RATIONAL":
+				# TODO which one makes more sense?
+				# activation = Rational(approx_func='leaky_relu')
+				activation = Rational(approx_func='relu')
+				self.activations.append(activation)
+			else:
+				raise ValueError(f"{cfg.MODEL.NCA_ACTIVATION=}")
+
+			current_layer = Conv2D(cfg.MODEL.HIDDEN_FILTER_SIZE, 1,
+			 activation=activation)(previous_layer)
 
 			if cfg.MODEL.SKIP_CONNECTIONS:
 				current_layer = tf.keras.layers.Add(name=f"skip_connection_{i}")([current_layer, previous_layer])
 
 			if cfg.MODEL.BATCH_NORM:
-				current_layer = tf.keras.layers.BatchNormalization()(current_layer)
-
-			if cfg.MODEL.LEAKY_RELU:
-				current_layer = tf.keras.layers.LeakyReLU()(current_layer)
-			else:
-				current_layer = tf.keras.layers.ReLU()(current_layer)
+				current_layer = tf.keras.layers.BatchNormalization()(current_layer)		
 
 			if cfg.EXTRA.LOG_LAYERS:
 				output_layers.append(f"hidden_{i}", current_layer)
@@ -282,14 +392,20 @@ class CAModel(tf.keras.Model):
 		if cfg.MODEL.BATCH_NORM:
 			current_layer = tf.keras.layers.BatchNormalization()(current_layer)
 
+		if cfg.MODEL.NCA_ACTIVATION == "RATIONAL":
+			activation = Rational(approx_func='identity')
+			self.activations.append(activation)
+		else:
+			activation = None
+
 		if cfg.MODEL.LAST_LAYER_INIT == "ZEROS":
-			final_layer = Conv2D(self.channel_n, 1, activation=None, name="last_layer",
+			final_layer = Conv2D(self.channel_n, 1, activation=activation, name="last_layer",
 								kernel_initializer=tf.zeros_initializer)(previous_layer)
 		elif cfg.MODEL.LAST_LAYER_INIT == "GLOROT":
-			final_layer = Conv2D(self.channel_n, 1, activation=None, name="last_layer",
+			final_layer = Conv2D(self.channel_n, 1, activation=activation, name="last_layer",
 								kernel_initializer=tf.keras.initializers.GlorotNormal)(previous_layer)
 		elif cfg.MODEL.LAST_LAYER_INIT == "RANDOM_NORMAL":
-			final_layer = Conv2D(self.channel_n, 1, activation=None, name="last_layer",
+			final_layer = Conv2D(self.channel_n, 1, activation=activation, name="last_layer",
 								kernel_initializer=tf.keras.initializers.RandomNormal(mean=0, stddev=0.025))(previous_layer)
 		else:
 			raise ValueError(f"Initializer {cfg.MODEL.LAST_LAYER_INIT}, not implemented")
@@ -585,6 +701,9 @@ class CAModel(tf.keras.Model):
 	# @tf.function
 	def classify(self, x):
 		""" Returns lossable RGBA channels """
+		if cfg.MODEL.NAME == "GANCA" and cfg.MODEL.GANCA_TANH:
+			x = np.tanh(x)
+
 		return x[:,:,:,:4]
 
 	@tf.function

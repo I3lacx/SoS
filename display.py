@@ -18,6 +18,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
 import plotly
+import textwrap
+
 
 
 class VideoWriter:
@@ -63,7 +65,8 @@ def show_simple_run(x0, ca, num_steps=20, batch=0, only_alive_cells=False, white
 	run = Video("./_autoplay.mp4", width=320, height=220, html_attributes="autoplay controls", embed=True)
 	return run
 
-def show_batch_run(x_dict, ca, num_steps, only_alive_cells=False, white_background=False, include_y=False, keep_input=False):
+def show_batch_run(x_dict, ca, num_steps, only_alive_cells=False, white_background=False,
+ include_y=False, keep_input=False, tanh_layer=False, better_video=False):
 	# Can be too memory heavy...
 	# *4 because of zoom
 
@@ -101,7 +104,13 @@ def show_batch_run(x_dict, ca, num_steps, only_alive_cells=False, white_backgrou
 				res = (x[:, :, :, 3].numpy() > 0.1).astype(np.float32)
 			full_step_array[i] = res
 		else:
-			res = rgba_to_rgb(ca.classify(x), white_background=white_background)
+			res = ca.classify(x)
+
+			# Important, this has to be before rgba to rgb!
+			if tanh_layer:
+				res = np.tanh(res)
+			res = rgba_to_rgb(res, white_background=white_background)
+
 			full_step_array[i] = res
 		x = ca(x)
 
@@ -147,8 +156,18 @@ def show_batch_run(x_dict, ca, num_steps, only_alive_cells=False, white_backgrou
 
 	single_img_size = 120
 	with VideoWriter("_autoplay.mp4") as vid:
-		for step_idx in range(num_steps):
-			vid.add(full_vid[step_idx])
+
+		if better_video:
+			for _ in range(20):
+				vid.add(full_vid[0])
+			for step_idx in range(num_steps):
+				if step_idx <= 10:
+					vid.add(full_vid[step_idx])
+					vid.add(full_vid[step_idx])
+				vid.add(full_vid[step_idx])
+		else:
+			for step_idx in range(num_steps):
+				vid.add(full_vid[step_idx])
 	run = Video("./_autoplay.mp4", width=single_img_size * width,
 	 height=single_img_size * height, html_attributes="autoplay controls", embed=True)
 	# print(key_list[batch_idx])
@@ -265,8 +284,6 @@ def plot_session(sess_id):
 
 	fig = utils.read_json()
 
-import textwrap
-
 
 def make_small_fig(y, title="", return_fig=True):
 	fig = go.Figure(go.Scatter(y=y))
@@ -301,10 +318,15 @@ def plot_ganca_loss(loss_dict, title_text=utils.get_cfg_infos(), textwrap_width=
 	d_real = go.Scatter(y=loss_dict["train"]["disc_loss_real"], name="disc_loss_real")
 	d_fake = go.Scatter(y=loss_dict["train"]["disc_loss_fake"], name="disc_loss_fake")
 	ganca = go.Scatter(y=loss_dict["train"]["ganca_loss"], name="ganca_loss")
+
 	fig.add_trace(d_real)
 	fig.add_trace(d_fake)
 	fig.add_trace(ganca)
 
+	if cfg.TRAIN.GEN_L2_LOSS:
+		gen_l2 = go.Scatter(y=loss_dict["train"]["gen_l2_loss"], name="gen_l2_loss")
+		fig.add_trace(gen_l2)
+	
 	fig.layout.title.text = "<br>".join(textwrap.wrap(title_text, width=textwrap_width))
 	fig.layout.title.font.size = 12
 
@@ -320,6 +342,39 @@ def plot_ganca_loss(loss_dict, title_text=utils.get_cfg_infos(), textwrap_width=
 		return fig
 	else:
 		fig.show()
+
+
+def plot_wgan_loss(loss_dict, title_text=utils.get_cfg_infos(), textwrap_width=120, y_range="auto",
+					return_plot=False):
+	fig = go.Figure()
+
+	d_real = go.Scatter(y=loss_dict["train"]["disc_loss_real"], name="critic")
+	ganca = go.Scatter(y=loss_dict["train"]["ganca_loss"], name="ganca")
+
+	fig.add_trace(d_real)
+	fig.add_trace(ganca)
+
+	if cfg.TRAIN.GEN_L2_LOSS:
+		gen_l2 = go.Scatter(y=loss_dict["train"]["gen_l2_loss"], name="gen_l2_loss")
+		fig.add_trace(gen_l2)
+	
+	fig.layout.title.text = "<br>".join(textwrap.wrap(title_text, width=textwrap_width))
+	fig.layout.title.font.size = 12
+
+	if type(y_range) in [list, tuple]:
+		fig.update_yaxes(range=y_range)
+	elif y_range == "auto":
+		# automatically find decent y_range
+		means = np.mean(np.stack(list(loss_dict["train"].values()), axis=0), axis=0)
+		max_y = np.median(loss_dict["train"]["ganca_loss"]) * 2
+		fig.update_yaxes(range=(-2, 2))
+
+	if return_plot:
+		return fig
+	else:
+		fig.show()
+
+
 
 def plot_train_and_val_loss(train_losses, val_loss_dict, smoothing_weight=0.8, y_range=None,
 	title_text=utils.get_cfg_infos(), textwrap_width=120, mean_val=True, return_plot=False):

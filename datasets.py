@@ -67,6 +67,8 @@ class Dataset():
 		using the fill function, which accepts a size and returns tha same shape as full_size[1:]"""
 		
 		num_partitions = len(targets)
+
+		assert num_partitions > 0, "Number of targets can not be zero! Train/Val/Test all need at least one target "
 		x_partition = np.empty(full_size, dtype=cfg.MODEL.FLOATX)
 		y_partition = np.empty(full_size[:3] + (4,), dtype=cfg.MODEL.FLOATX)
 
@@ -137,7 +139,7 @@ class Dataset():
 
 		return dataset, seperator
 
-	def get_all_img_types(self, data_set, idx_offset=0, random_idx=False, include_y=False):
+	def get_all_img_types(self, data_set, idx_offset=0, random_idx=False, include_y=False, max_num=float('inf')):
 		""" Returns dict with imgs for each type of data
 		offset 0 to alwalys get the first, random to get a random in correct range
 		data_set from "train", "val", "test"
@@ -146,6 +148,9 @@ class Dataset():
 		img_dict = {}
 		for item_name, item_dict in self.seperator[data_set].items():
 			for key, value in item_dict.items():
+				if len(img_dict) > max_num:
+					print("reached max number of entries")
+					return img_dict
 				if random_idx:
 					cur_idx = np.random.randint(value[0], value[1])
 				else:
@@ -169,7 +174,7 @@ class EmojiDataset(Dataset):
 		self.train_targets, self.val_targets, self.test_targets = self.get_targets()
 
 		# idx of fonts, not nice here, not sure where else...
-		self.unique_fonts = []
+		self.unique_env = []
 
 		# TODO targets for train/val seperate 
 		# Defines the boundaries where which type of data is stored
@@ -212,8 +217,20 @@ class EmojiDataset(Dataset):
 		# TODO from file option hardcoded here...
 		emoji_obj = Emoji(targets[idx], from_file=self.from_file)
 
-		emoji_y = emoji_obj.emoji_img
+		# Add differentiator here to not add y image if image is self drawn...
+		# y could just be filled by a different emoji? Or just the same?
+		if "self_drawn" in targets[idx]:
+			# Do self drawn stuff
+			# get single y/emoji/y
+			# TODO hard coded single emoji to fill self drawn slots
+			edge_img = emoji_obj.emoji_img
+			emoji_y_obj = Emoji("emojis/people/microsoft/confused-face_1f615", from_file=True)
+			emoji_y = emoji_y_obj.emoji_img
+		else:
+		# print(f"{size[0]=}")
+			emoji_y = emoji_obj.emoji_img
 
+		# print(f"{targets[idx]=}, {emoji_y=}")
 		# If file has not loaded correctly 
 		if self.from_file and emoji_y is None:
 			# Deletes target from list like it was never there
@@ -226,26 +243,40 @@ class EmojiDataset(Dataset):
 		damaged_idx = int(size[0] * cfg.DATA.DAMAGE)
 
 		if cfg.DATA.SEED == "EDGES":
+
 			# Create edge image
-			edge_emoji = emoji_obj.get_gray_edge_image()
+			if "self_drawn" in targets[idx]:
+				edge_emoji = emoji_obj.get_self_drawn_edges()
+			else:
+				edge_emoji = emoji_obj.get_gray_edge_image()
 			edge_emoji = add_padding(edge_emoji, cfg.DATA.GRID_SIZE)
 
 			single_x = np.zeros((1,) + size[1:])
 			single_x[:,:,:,:4] = edge_emoji[None, :]
 
-			if cfg.WORLD.ENV_SIZE > 0:
+			if cfg.DATA.ENVIRONMENT_INFORMATION is not None:
 				single_x[:,:,:,-cfg.WORLD.ENV_SIZE:] = self.fill_env(size, idx, targets)
 
-			full_x = np.repeat(single_x, size[0], axis=0)	
- 
+			if cfg.DATA.SUPERPIXEL_COLOR or cfg.DATA.SUPERPIXEL_FIXED:
+				# Layers information ontop of the edge image or in env channel
+				single_x = self.add_superpixel_color(single_x, single_y)
+
+			full_x = np.repeat(single_x, size[0], axis=0)   
+
+		elif cfg.DATA.SEED == "BLANK":
+			# Fill with zeros and activate middle pixel
+			full_x = np.zeros(size)
+			mid = size[1] // 2
+			full_x[:,mid,mid,3:] = 1.0
+
 		if cfg.DATA.NOISE > 0:
 
 			# Add gaussian noise to all images
 			if cfg.DATA.BINARY_NOISE:
 				noise = np.random.normal(0, cfg.DATA.NOISE, list(size[:3]) + [1])
 				# TODO hard coded value if noise is added or not here
-				noise = np.array(np.abs(noise) > 0.65, dtype=cfg.MODEL.FLOATX)	
-				noise = np.repeat(noise, 4, axis=3)		
+				noise = np.array(np.abs(noise) > 0.65, dtype=cfg.MODEL.FLOATX)  
+				noise = np.repeat(noise, 4, axis=3)     
 			else:
 				noise = np.random.normal(0, cfg.DATA.NOISE, size)
 
@@ -256,7 +287,7 @@ class EmojiDataset(Dataset):
 			if cfg.DATA.BINARY_NOISE:
 				full_x[:,:,:,:4] += noise
 			else:
-				# apply noise	
+				# apply noise   
 				full_x = full_x + noise
 
 			if cfg.DATA.CLIP_NOISE:
@@ -270,16 +301,72 @@ class EmojiDataset(Dataset):
 
 		return full_x, full_y, cur_seperator
 
+	def add_superpixel_color(self, single_x, single_y):
+		from skimage.measure import regionprops
+		from skimage.segmentation import slic
+		# TODO can randomize those things to make it different?
+		# But this would have to be different for each image in full x not single x
+
+		# Switches if information is saved in the env layer or in the rgb layers
+		if cfg.DATA.SUPERPIXEL_FIXED:
+			z_start = 4
+			z_end = 8
+		else:
+			z_start = 0
+			z_end = 4
+
+		if cfg.DATA.SUPERPIXEL_RANDOMIZED:
+			seg_val = cfg.DATA.SUPERPIXEL_NUM_SEGMENTS
+			num_segments = np.random.choice(range(seg_val//2, seg_val*2))
+			sig_val = cfg.DATA.SUPERPIXEL_SIGMA
+			sigma = np.random.choice(range(sig_val-1, sig_val+2))
+		else:
+			num_segments = cfg.DATA.SUPERPIXEL_NUM_SEGMENTS
+			sigma = cfg.DATA.SUPERPIXEL_SIGMA
+		
+		segments = slic(single_y[0,:,:,:3], n_segments=num_segments, sigma=sigma, start_label=1)
+		regions = regionprops(segments)
+
+		for props in regions:
+			# centroid coordinates, possible to do 3x3
+			cx, cy = props.centroid
+			cx = int(np.around(cx))
+			cy = int(np.around(cy))
+
+			if cfg.DATA.SUPERPIXEL_RANDOMIZED:
+				size_idx_x = np.random.choice([0,1,2])
+				size_idx_y = np.random.choice([0,1,2])
+			else:
+				# 0 for 1 pixel, 1 for 3x3
+				size_idx_x = 1
+				size_idx_y = 1
+
+			# x/y start and end positions
+			xs = cx - size_idx_x
+			xe = cx + size_idx_x + 1
+			ys = cy - size_idx_y
+			ye = cy + size_idx_y + 1
+			# use colored pixel information from final image on x
+			# TODO this forces and does not check, but will take area around pixel not single one
+			single_x[:, xs:xe, ys:ye, z_start:z_end] = single_y[:, xs:xe, ys:ye, :4]
+
+		return single_x
+
+
 	def fill_env(self, size, idx, targets):
 		""" returns enviroment information """
 		env = np.zeros((1,) + size[1:3] + (cfg.WORLD.ENV_SIZE,))
-		# TODO pretty hard coded stuff here...
-		font_name = targets[idx].split("/")[2]
-		
-		if font_name not in self.unique_fonts:
-			self.unique_fonts.append(font_name)
 
-		font_idx = self.unique_fonts.index(font_name)
+		if cfg.DATA.ENVIRONMENT_INFORMATION == "FONT":
+			name = targets[idx].split("/")[2]
+		elif cfg.DATA.ENVIRONMENT_INFORMATION == "EMOJI":
+			name = targets[idx].split("/")[-1]
+
+		if name not in self.unique_env:
+			self.unique_env.append(name)
+
+
+		font_idx = self.unique_env.index(name)
 		# one hot encode font information
 		env[:,:,:,font_idx] = 1
 
@@ -425,7 +512,7 @@ class FacesDataset(Dataset):
 		return full_x, full_y, cur_seperator
 
 def to_ten_dim_label(x, y):
-	""" Converts y into 28x28 images with 10 depth for prediction	"""
+	""" Converts y into 28x28 images with 10 depth for prediction   """
 	# Maybe improve performance
 
 	# x shape is [b, r, c]
@@ -569,6 +656,14 @@ class Emoji:
 		plt.imshow(self.emoji_img)
 		plt.axis("off")
 		plt.show()
+
+	def get_self_drawn_edges(self):
+		""" converts self.img into same type of images like the edge images """
+		if cfg.DATA.BINARY_X:
+			img = np.array(self.emoji_img > 0.1, dtype=cfg.MODEL.FLOATX)
+
+		img = np.repeat(img[:,:,3:4], 4, axis=-1)
+		return img
 
 	def get_gray_edge_image(self, img=None):
 		""" turns input emoji image into edge image """

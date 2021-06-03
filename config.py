@@ -21,7 +21,7 @@ class _ConfigModule:
 
 		for key in params.keys():
 			# Not needed, but makes sure that all parameters are defined above!
-			assert hasattr(self, key)
+			assert hasattr(self, key), f"Setting: {key}, does not exist in {type(self)}!"
 			setattr(self, key, params[key])
 
 
@@ -51,6 +51,14 @@ class _Dataset(_ConfigModule):
 	# TODO might be better to add noise as a boolean option?
 	# As concatenated string, e.g.: "EDGES NOISE", "EDGES", "EMPTY NOISE"?
 	SEED = "EDGES"
+	SUPERPIXEL_COLOR = False	# Superpixel_fixed forces this value on true
+	SUPERPIXEL_FIXED = False	# Only works with env size on 4! Puts superpixel information in env
+	SUPERPIXEL_NUM_SEGMENTS = 10	# Superpixels have to be enabled for this setting
+	SUPERPIXEL_SIGMA = 2
+	SUPERPIXEL_RANDOMIZED = False	# randomize sigma and number of settings by a bit for each img
+	# SUPERPIXEL_PERCENT = 1.		# Float for how much of the dataset contains initial superpixel infos
+
+
 	NOISE = 0.4			# Variance of the gaussian noise with 0 mean. 0 for no noise
 	# TODO better way of storing?
 	ONLY_POS_NOISE = False
@@ -61,7 +69,11 @@ class _Dataset(_ConfigModule):
 	EDGE_DETECTION = "CANNY"
 	DAMAGE = 0			# How much of the Dataset will be damaged, 0 for no damage
 
+	ENVIRONMENT_INFORMATION = None # @[FONT, EMOJI] (Font not fully tested)
+
+	GANCA_NOISE_STD = 0.1
 	DISC_INPUT_NOISE = False
+	GANCA_GEN_NOISE = False
 	GANCA_NORM_INPUT = False
 	# Size of each part of the dataset
 	TRAIN_SIZE = 1000
@@ -105,15 +117,23 @@ class _Model(_ConfigModule):
 	RESET_ACTIVATION = None # possible strings for activation functions: ["clipping", "sigmoid"]
 	RESET_NOISE = 1e-3
 
-	LEAKY_RELU = False
+	LEAKY_RELU = None # Depricated Warning? is replaced through nca activation...
+	NCA_ACTIVATION = "RELU" # @[RELU, LEAKY_RELU, RATIONAL]
 	FLOATX = 'float32' # or float64, which float based will be used for all operations
 
 	GANCA_LR = 1e-3
 	DISC_LR = 1e-4
+	GEN_L2_LR = 1e-3
 
 	GANCA_TANH = False
 	GANCA_EXTRA_LAYER = False
 
+	BUGGED_DISC = False		# Fixed Bug which made disc very small, if want old behavior use this
+	TRAIN_DISC = False		# Activates layer in discriminator to allow classification training
+	# EMBEDDING_LAYER = False		# Uses random numbers as input to pass through an embedding layer
+	LATENT_DIM = None		# Only used when embedding_layer true
+
+	DISC_SIZE = 128
 	# TODO last layer init and gru and bias maybe better options
 	GRU = False
 	GRU_BIAS = True 
@@ -147,10 +167,20 @@ class _Training(_ConfigModule):
 	USE_Y_POOL = False	# Added option at 16.11
 
 	LOSS_TYPE = "l2"
+	
+	GANCA_LOSS_TYPE = "CROSS_ENTROPY"
+	WGAN_CRITIC_LR = 0.00005
+	WGAN_CRITIC_CLIP = 0.01
+	WGAN_CRITIC_ITERS = 5
+
 	ADD_NOISE = True # TODO YOS THIS IS USED DURING EACH CALL
 	LR = 1e-3
 	LAYER_NORM = True
+	GANCA_LAYER_NORM = False
+	LABEL_SMOOTHING = 0
 
+	GEN_L2_LOSS = False
+	GANCA_USE_OLD = False
 	REGULARIZER = False 
 	FORCE_ALIVE = False 	# Forcing the middle cells to have alpha >= 0.1
 
@@ -201,7 +231,7 @@ settings.add_setting("init", world_dict, data_dict, model_dict, train_dict, extr
 
 # Adds session id to extra dict so it will be visible in plots
 # Initialize Classes with config settings, select dict by names found in settings file
-settings_name = "ganca_testing"
+settings_name = "good_wanca"
 WORLD = _World(settings.world_settings[settings_name])
 DATA  = _Dataset(settings.data_settings[settings_name])
 MODEL = _Model(settings.model_settings[settings_name])
